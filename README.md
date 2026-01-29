@@ -14,7 +14,7 @@ The app requires Python 3.10+ due to these dependencies:
 
 ### Azure Web App Settings
 1. **Runtime stack:** Python 3.11
-2. **Startup command:** `python -m streamlit run app.py --server.port 8000 --server.address 0.0.0.0`
+2. **Startup command:** `python -m streamlit run webapp.py --server.port 8000 --server.address 0.0.0.0`
 
 ### Deployment Steps
 1. Create Azure Web App with Python 3.11 runtime
@@ -28,7 +28,7 @@ cd webapp
 python -m venv venv
 .\venv\Scripts\activate  # Windows
 pip install -r requirements.txt
-streamlit run app.py
+streamlit run webapp.py
 ```
 
 ## Features
