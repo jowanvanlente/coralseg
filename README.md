@@ -5,21 +5,19 @@ Convert sparse point annotations (from CoralNet) into dense segmentation masks i
 ## Azure Deployment
 
 ### Runtime Stack
-**Python 3.11** (recommended)
-
-The app requires Python 3.10+ due to these dependencies:
-- `numpy>=2.0.0` requires Python 3.10+
-- `scipy>=1.14.0` requires Python 3.10+
-- `scikit-image>=0.24.0` requires Python 3.10+
+**Python 3.10 or 3.11** (recommended: 3.11)
 
 ### Azure Web App Settings
 1. **Runtime stack:** Python 3.11
-2. **Startup command:** `python -m streamlit run webapp.py --server.port 8000 --server.address 0.0.0.0`
+2. **Startup command:** `python -m streamlit run webapp.py --server.port $PORT --server.address 0.0.0.0 --server.headless true`
 
-### Deployment Steps
+> **Note:** Azure sets the `PORT` environment variable automatically. The startup command uses `$PORT` to bind to the correct port.
+
+### Deployment Steps (GitHub Integration)
 1. Create Azure Web App with Python 3.11 runtime
-2. Deploy the `webapp/` folder contents
-3. Set the startup command in Configuration > General settings
+2. Connect to your GitHub repository (select the `webapp/` folder as source if using monorepo)
+3. Set the **Startup command** in Configuration > General settings
+4. The `.streamlit/config.toml` handles headless mode and CORS settings
 
 ## Local Development
 
