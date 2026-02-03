@@ -5,10 +5,10 @@
 name: Build and deploy Python app to Azure Web App - coralseg1
 
 on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
+  # push:  # Disabled - using Container Apps instead
+  #   branches:
+  #     - main
+  workflow_dispatch:  # Manual trigger only
 
 jobs:
   build:

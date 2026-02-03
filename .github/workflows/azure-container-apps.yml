@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_CONTAINER_APP_NAME: coralseg
-  AZURE_RESOURCE_GROUP: <your-resource-group>
-  AZURE_CONTAINER_REGISTRY: <your-acr-name>.azurecr.io
+  AZURE_CONTAINER_APP_NAME: coralseg-containerapp
+  AZURE_RESOURCE_GROUP: DSIAD
+  AZURE_CONTAINER_REGISTRY: coralsegacr.azurecr.io
   IMAGE_NAME: coralseg
 
 jobs:
@@ -25,12 +25,12 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_7E1A807984CD46D1A2877E5708951AF4 }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_366A543F1CF042D8AF23821EFCB793D0 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_7FE26F39EB3F468EB5CD1F7A76BCEF8A }}
 
       - name: Login to Azure Container Registry
-        run: az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY }}
+        run: az acr login --name coralsegacr
 
       - name: Build and push Docker image
         run: |

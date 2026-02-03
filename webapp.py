@@ -22,18 +22,10 @@ from adaptive_segmentation import multi_scale_adaptive_labeling
 from graph_segmentation import multi_scale_graph_labeling
 from coco_export import export_to_coco_dict
 
-st.set_page_config(page_title="Sparse to Dense COCO", layout="wide")
+st.set_page_config(page_title="Annotation Segmentation", layout="wide")
 
-st.title("Sparse Annotations → Full Segmentations → COCO")
-st.caption("Transform sparse point annotations into dense segmentation masks exported in COCO format.")
-
-st.markdown("""
-This tool converts **sparse point annotations** (e.g., from CoralNet) into **full dense segmentation masks**. 
-It uses multi-scale algorithms to propagate labels from annotated points to cover the entire image.
-
-**Why COCO format?** [COCO (Common Objects in Context)](https://cocodataset.org/#format-data) is the industry-standard format for object detection and segmentation datasets. 
-It stores polygon/mask annotations in a structured JSON file, making it compatible with training frameworks like Roboflow, Detectron2, and YOLO.
-""")
+st.title("Annotation-Based Segmentation")
+st.caption("Test segmentation methods on sparse point annotations and export to COCO format.")
 
 # ==================== SIDEBAR: Data Upload ====================
 st.sidebar.title("📤 Upload Data")
@@ -110,13 +102,26 @@ uploaded_images = st.sidebar.file_uploader(
 )
 
 if uploaded_images:
+    upload_errors = []
     for img_file in uploaded_images:
         if img_file.name not in st.session_state.images:
-            file_bytes = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
-            img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-            st.session_state.images[img_file.name] = img
-            img_file.seek(0)
-    st.sidebar.success(f"✓ {len(st.session_state.images)} images loaded")
+            try:
+                file_bytes = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
+                img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                if img is not None:
+                    st.session_state.images[img_file.name] = img
+                else:
+                    upload_errors.append(img_file.name)
+                img_file.seek(0)
+            except Exception as e:
+                upload_errors.append(f"{img_file.name}: {str(e)[:50]}")
+    if st.session_state.images:
+        st.sidebar.success(f"✓ {len(st.session_state.images)} images loaded")
+    if upload_errors:
+        with st.sidebar.expander("⚠️ Upload issues", expanded=True):
+            st.warning("Some files failed. Try uploading fewer/smaller images at once.")
+            for err in upload_errors[:5]:
+                st.caption(f"• {err}")
 
 # Annotations upload
 st.sidebar.markdown("### 📍 Annotations")
@@ -736,14 +741,30 @@ else:
     
     with col_params:
         st.markdown("**Parameters**")
-        scale_factor = st.slider("Processing Scale", 0.1, 1.0, 0.4, 0.1, key="export_scale")
+        scale_factor = st.slider("Processing Scale", 0.1, 1.0, st.session_state.custom_defaults['scale_factor'], 0.1, key="export_scale")
         
         if seg_method == "🔷 Superpixel (SLIC)":
-            seg_params = {'scales': [3000, 900, 30]}
+            with st.expander("⚙️ Scale Settings", expanded=False):
+                exp_s1 = st.number_input("Scale 1 (many small)", 100, 10000, st.session_state.custom_defaults['superpixel'][0], 100, key="exp_sp1")
+                exp_s2 = st.number_input("Scale 2 (medium)", 10, 5000, st.session_state.custom_defaults['superpixel'][1], 10, key="exp_sp2")
+                exp_s3 = st.number_input("Scale 3 (few large)", 10, 1000, st.session_state.custom_defaults['superpixel'][2], 10, key="exp_sp3")
+            seg_params = {'scales': [exp_s1, exp_s2, exp_s3]}
         elif seg_method == "🎯 Adaptive (Density-based)":
-            seg_params = {'scales': [1.0, 0.5, 0.25], 'min_distance': 10, 'density_threshold': 5, 'allow_overwrite': False}
+            with st.expander("⚙️ Scale Settings", expanded=False):
+                exp_as1 = st.slider("Scale 1 (coarse)", 0.1, 1.0, st.session_state.custom_defaults['adaptive'][0], 0.1, key="exp_ad1")
+                exp_as2 = st.slider("Scale 2 (medium)", 0.1, 1.0, st.session_state.custom_defaults['adaptive'][1], 0.1, key="exp_ad2")
+                exp_as3 = st.slider("Scale 3 (fine)", 0.1, 1.0, st.session_state.custom_defaults['adaptive'][2], 0.05, key="exp_ad3")
+                exp_min_dist = st.slider("Min segment distance", 5, 50, st.session_state.custom_defaults['adaptive_min_dist'], 5, key="exp_min_dist")
+                exp_density = st.slider("Density threshold", 1, 20, st.session_state.custom_defaults['adaptive_density'], 1, key="exp_density")
+                exp_allow_ow = st.checkbox("Allow overwriting", value=False, key="exp_allow_ow_ad")
+            seg_params = {'scales': [exp_as1, exp_as2, exp_as3], 'min_distance': exp_min_dist, 'density_threshold': exp_density, 'allow_overwrite': exp_allow_ow}
         else:
-            seg_params = {'scales': [100, 300, 1000], 'allow_overwrite': False}
+            with st.expander("⚙️ Scale Settings", expanded=False):
+                exp_g1 = st.number_input("Scale 1 (fine)", 10, 500, st.session_state.custom_defaults['graph'][0], 10, key="exp_g1")
+                exp_g2 = st.number_input("Scale 2 (medium)", 50, 1000, st.session_state.custom_defaults['graph'][1], 50, key="exp_g2")
+                exp_g3 = st.number_input("Scale 3 (coarse)", 100, 5000, st.session_state.custom_defaults['graph'][2], 100, key="exp_g3")
+                exp_allow_ow_g = st.checkbox("Allow overwriting", value=False, key="exp_allow_ow_g")
+            seg_params = {'scales': [exp_g1, exp_g2, exp_g3], 'allow_overwrite': exp_allow_ow_g}
     
     st.markdown("---")
     
