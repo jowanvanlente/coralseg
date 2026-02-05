@@ -20,12 +20,53 @@ from utils import load_labelset_from_json, load_annotations_from_df, scale_image
 from superpixel_labeling import multi_scale_labeling
 from adaptive_segmentation import multi_scale_adaptive_labeling
 from graph_segmentation import multi_scale_graph_labeling
+from hybrid_segmentation import multi_scale_hybrid_labeling
 from coco_export import export_to_coco_dict
+from confidence_scoring import calculate_region_confidence, apply_confidence_threshold, get_confidence_summary
 
 st.set_page_config(page_title="Annotation Segmentation", layout="wide")
 
+# Compact UI styling
+st.markdown("""
+<style>
+    .stSlider > div > div > div > div { height: 0.4rem; }
+    .stSlider label { font-size: 0.85rem; }
+    div[data-testid="stExpander"] details summary { font-size: 0.9rem; padding: 0.3rem 0; }
+    .stButton button { padding: 0.3rem 0.8rem; font-size: 0.85rem; }
+    .stMarkdown p { margin-bottom: 0.3rem; }
+    .stCaption { font-size: 0.75rem; }
+    h1 { font-size: 1.8rem !important; margin-bottom: 0.3rem !important; }
+    h2 { font-size: 1.3rem !important; }
+    h3 { font-size: 1.1rem !important; }
+    .stTabs [data-baseweb="tab-list"] { gap: 0.5rem; }
+    .stTabs [data-baseweb="tab"] { padding: 0.3rem 0.8rem; font-size: 0.85rem; }
+    div[data-testid="stNumberInput"] input { padding: 0.2rem 0.4rem; font-size: 0.85rem; }
+    .stSelectbox label, .stRadio label { font-size: 0.85rem; }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("Annotation-Based Segmentation")
-st.caption("Test segmentation methods on sparse point annotations and export to COCO format.")
+st.caption("Turn sparse point annotations (CSV) into full segmentation masks, then export to COCO JSON.")
+
+with st.expander("ℹ️ Start here (what to do)", expanded=False):
+    st.markdown(
+        """
+        **Goal:** create a segmentation mask for each image using sparse point labels, then export to COCO for Roboflow.
+
+        **Step-by-step**
+        1. **Upload images** (left sidebar).
+        2. **Upload annotations CSV** (left sidebar).
+        3. Click **(Re)load images and annotations** (main page) to make sure filenames line up.
+        4. Use **Test Segmentation** to verify the result on one image.
+        5. Use **Export COCO** to process many images and download COCO JSON.
+
+        **Common pitfall: filenames**
+        - The CSV column `Name` must refer to the same filenames as your uploaded images.
+        - This app does *normalized matching* to handle cases like double extensions:
+          - `photo.jpeg.jpeg` -> `photo.jpeg`
+          - `G0258570.JPG.JPG` -> `G0258570.JPG`
+        """
+    )
 
 # ==================== SIDEBAR: Data Upload ====================
 st.sidebar.title("📤 Upload Data")
@@ -54,12 +95,237 @@ if 'test_result' not in st.session_state:
 if 'custom_defaults' not in st.session_state:
     st.session_state.custom_defaults = {
         'scale_factor': 0.4,
+        'num_rounds': 3,
         'superpixel': [3000, 900, 30],
         'adaptive': [1.0, 0.5, 0.25],
         'adaptive_min_dist': 10,
         'adaptive_density': 5,
         'graph': [100, 300, 1000]
     }
+
+# ==================== SMART SCALE CALCULATION ====================
+def compute_smart_superpixel_scales(processing_scale: float, num_rounds: int) -> list:
+    """
+    Compute smart superpixel counts based on processing scale.
+    
+    At full resolution (1.0), we'd use base values like [3000, 900, 30].
+    At lower resolution, the image has fewer pixels (scale²), so we need
+    proportionally fewer superpixels to achieve similar region sizes.
+    
+    Base values at scale=1.0: [5000, 1500, 500, 50] for 4 rounds
+    """
+    area_factor = processing_scale ** 2  # Image area scales quadratically
+    
+    # Base values for full resolution (scale=1.0), decreasing for gap-filling
+    base_values = [5000, 1500, 500, 50]
+    
+    # Scale down based on image area, with minimum values
+    scaled = []
+    for i in range(num_rounds):
+        val = int(base_values[i] * area_factor)
+        # Ensure minimum sensible values
+        min_vals = [100, 50, 20, 10]
+        scaled.append(max(val, min_vals[i]))
+    
+    return scaled
+
+def compute_smart_adaptive_scales(processing_scale: float, num_rounds: int) -> list:
+    """
+    Compute smart adaptive resolution multipliers.
+    
+    These are relative to the already-scaled image, so we use a progression
+    from coarse to fine. At lower processing scales, we can use higher
+    relative multipliers since the image is already small.
+    """
+    # Progression from 1.0 (full) down to finer scales
+    # At low processing_scale, the watershed already works on small image,
+    # so we can afford higher multipliers
+    if num_rounds == 1:
+        return [1.0]
+    elif num_rounds == 2:
+        return [1.0, 0.5]
+    elif num_rounds == 3:
+        return [1.0, 0.5, 0.25]
+    else:  # 4 rounds
+        return [1.0, 0.6, 0.35, 0.15]
+
+def compute_smart_graph_scales(processing_scale: float, num_rounds: int) -> list:
+    """
+    Compute smart graph segmentation thresholds based on processing scale.
+    
+    The threshold controls how aggressively regions merge. At lower resolution,
+    pixel differences are averaged over larger areas, so we may need slightly
+    higher thresholds to get similar behavior.
+    """
+    # Base thresholds at scale=1.0, increasing for more aggressive merging
+    base_values = [100, 300, 800, 2000]
+    
+    # At lower scales, increase thresholds slightly (fewer pixels = need looser merging)
+    # But not too aggressively - factor of ~1/sqrt(scale) is reasonable
+    scale_adjustment = 1.0 / (processing_scale ** 0.5)
+    scale_adjustment = min(scale_adjustment, 3.0)  # Cap at 3x
+    
+    scaled = []
+    for i in range(num_rounds):
+        val = int(base_values[i] * scale_adjustment)
+        scaled.append(val)
+    
+    return scaled
+
+def get_smart_defaults(method: str, processing_scale: float, num_rounds: int) -> list:
+    """Get smart default values for a given method, scale, and number of rounds."""
+    if method == "superpixel":
+        return compute_smart_superpixel_scales(processing_scale, num_rounds)
+    elif method == "adaptive":
+        return compute_smart_adaptive_scales(processing_scale, num_rounds)
+    else:  # graph
+        return compute_smart_graph_scales(processing_scale, num_rounds)
+
+# ==================== SCALE-ADAPTIVE PARAMETER SYSTEM ====================
+import math
+
+# Log-spaced options for sliders (allows fine control at low values)
+LOG_OPTIONS_10K = [1, 2, 3, 5, 8, 10, 15, 20, 30, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 7500, 10000]
+LOG_OPTIONS_5K = [1, 2, 3, 5, 8, 10, 15, 20, 30, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000]
+AD_OPTIONS = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+def clamp_to_options(val, options):
+    """Find the closest value in options list."""
+    return min(options, key=lambda x: abs(x - val))
+
+def scale_value(base_val, processing_scale, method):
+    """
+    Convert base value (at 100% scale) to display value for current processing scale.
+    
+    Superpixel: base_val * scale² (area proportional)
+    Graph: base_val / sqrt(scale) (threshold adjustment)
+    Adaptive: no scaling (relative multipliers)
+    """
+    if method == "superpixel":
+        return base_val * (processing_scale ** 2)
+    elif method == "graph":
+        return base_val / (processing_scale ** 0.5)
+    else:  # adaptive
+        return base_val  # No scaling for adaptive (already relative)
+
+def unscale_value(display_val, processing_scale, method):
+    """
+    Convert display value back to base value (at 100% scale).
+    Inverse of scale_value.
+    """
+    if method == "superpixel":
+        return display_val / (processing_scale ** 2)
+    elif method == "graph":
+        return display_val * (processing_scale ** 0.5)
+    else:  # adaptive
+        return display_val
+
+def get_base_defaults(method, num_rounds):
+    """Get default BASE values (at 100% scale) for a method."""
+    if method == "superpixel":
+        return [5000, 1500, 500, 50][:num_rounds]
+    elif method == "graph":
+        return [100, 300, 800, 2000][:num_rounds]
+    else:  # adaptive
+        if num_rounds == 1:
+            return [1.0]
+        elif num_rounds == 2:
+            return [1.0, 0.5]
+        elif num_rounds == 3:
+            return [1.0, 0.5, 0.25]
+        else:
+            return [1.0, 0.6, 0.35, 0.15]
+
+def init_base_values(prefix, method, num_rounds):
+    """Initialize base values in session state if not present."""
+    key = f"{prefix}_base_{method}"
+    if key not in st.session_state:
+        st.session_state[key] = get_base_defaults(method, num_rounds)
+    # Extend if num_rounds increased
+    current = st.session_state[key]
+    if len(current) < num_rounds:
+        defaults = get_base_defaults(method, num_rounds)
+        st.session_state[key] = current + defaults[len(current):num_rounds]
+    return st.session_state[key]
+
+def get_display_values(base_values, processing_scale, method, adapt_on, options):
+    """
+    Derive display values from base values.
+    If adapt_on: apply scaling formula
+    If adapt_off: show base values as-is
+    Always clamp to valid options.
+    """
+    display = []
+    for base in base_values:
+        if adapt_on:
+            scaled = scale_value(base, processing_scale, method)
+        else:
+            scaled = base
+        display.append(clamp_to_options(scaled, options))
+    return display
+
+def update_base_from_display(prefix, method, round_idx, display_val, processing_scale, adapt_on):
+    """
+    Update base value when user edits a display value.
+    If adapt_on: invert the scale formula
+    If adapt_off: store directly as base
+    """
+    key = f"{prefix}_base_{method}"
+    if key in st.session_state:
+        if adapt_on:
+            base = unscale_value(display_val, processing_scale, method)
+        else:
+            base = display_val
+        st.session_state[key][round_idx] = base
+
+def format_settings_txt(method, scale_factor, num_rounds, scale_values, seg_params, adapt_on, conf_threshold=0, conf_enabled=False):
+    """Format current segmentation settings as a text string for export."""
+    from datetime import datetime
+    
+    lines = [
+        "=" * 50,
+        "SEGMENTATION SETTINGS EXPORT",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "=" * 50,
+        "",
+        f"Method: {method}",
+        f"Processing Scale: {scale_factor * 100:.0f}%",
+        f"Number of Rounds: {num_rounds}",
+        f"Adapt Values: {'ON' if adapt_on else 'OFF'}",
+        "",
+        "--- Round Values ---",
+    ]
+    
+    for i, val in enumerate(scale_values):
+        lines.append(f"  Round {i+1}: {val}")
+    
+    lines.append("")
+    lines.append("--- Advanced Settings ---")
+    
+    if "hybrid" in method.lower():
+        lines.append("  (Default SLIC settings)")
+    elif "superpixel" in method.lower() or "slic" in method.lower():
+        lines.append("  (Default SLIC settings)")
+    elif "adaptive" in method.lower():
+        lines.append(f"  Min Distance: {seg_params.get('min_distance', 10)}")
+        lines.append(f"  Density Threshold: {seg_params.get('density_threshold', 5)}")
+        lines.append(f"  Allow Overwrite: {seg_params.get('allow_overwrite', False)}")
+    elif "graph" in method.lower():
+        lines.append(f"  Allow Overwrite: {seg_params.get('allow_overwrite', False)}")
+    
+    lines.append("")
+    lines.append("--- Confidence Filtering ---")
+    if conf_enabled:
+        lines.append(f"  Confidence Filtering: ON (Threshold: {conf_threshold})")
+    else:
+        lines.append("  Confidence Filtering: OFF")
+    
+    lines.append("")
+    lines.append("=" * 50)
+    lines.append("Use these settings to reproduce your segmentation results.")
+    lines.append("=" * 50)
+    
+    return "\n".join(lines)
 
 # Sample data loader
 st.sidebar.markdown("### 🎯 Quick Start")
@@ -81,7 +347,7 @@ if st.sidebar.button("📂 Load Sample Data", use_container_width=True,
                 loaded_count += 1
         
         # Load sample annotations
-        df = pd.read_csv(sample_csv_path)
+        df = pd.read_csv(sample_csv_path, low_memory=False)
         st.session_state.points_dict = load_annotations_from_df(df)
         total_annotations = sum(len(d) for d in st.session_state.points_dict.values())
         
@@ -98,7 +364,8 @@ uploaded_images = st.sidebar.file_uploader(
     "Upload images",
     type=['jpg', 'jpeg', 'png'],
     accept_multiple_files=True,
-    help="Upload your reef/coral images (.jpg, .jpeg, .png). These are the images you want to segment."
+    help=("Upload the images you want to segment (.jpg, .jpeg, .png). "
+          "Tip: image filenames should match the CSV `Name` column (this app can also handle some filename quirks like .JPG.JPG).")
 )
 
 if uploaded_images:
@@ -128,12 +395,14 @@ st.sidebar.markdown("### 📍 Annotations")
 uploaded_csv = st.sidebar.file_uploader(
     "Upload annotations CSV",
     type=['csv'],
-    help="CSV from CoralNet with columns: Name, Row, Column, Label. One point annotation per row."
+    help=("Upload the CoralNet (or similar) CSV with one annotation point per row. "
+          "Required columns are: Name, Row, Column, and a label column (e.g. Label or Label code). "
+          "Extra columns are OK and will be ignored.")
 )
 
 if uploaded_csv:
     try:
-        df = pd.read_csv(uploaded_csv)
+        df = pd.read_csv(uploaded_csv, low_memory=False)
         st.session_state.points_dict = load_annotations_from_df(df)
         total_points = sum(len(d) for d in st.session_state.points_dict.values())
         st.sidebar.success(f"✓ {total_points:,} annotations loaded")
@@ -243,8 +512,9 @@ st.session_state.labelset = load_labelset_from_json(st.session_state.labelset)
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📊 Status")
 st.sidebar.info(f"Images: {len(st.session_state.images)}")
-st.sidebar.info(f"Annotated images: {len(st.session_state.points_dict)}")
+st.sidebar.info(f"CSV image names: {len(st.session_state.points_dict)}")
 st.sidebar.info(f"Classes: {len(st.session_state.labelset)}")
+st.sidebar.caption("If matching looks wrong, open **Preview Annotations** to see exactly what matches and what doesn't.")
 
 # Annotation Preview Button
 if st.session_state.points_dict or st.session_state.images:
@@ -300,7 +570,7 @@ if st.session_state.show_annotation_preview:
     search_query = st.text_input("🔎 Search (type to filter):", key="ann_search")
     
     # Tabs for different views
-    tab1, tab2, tab3 = st.tabs(["✅ Matched", "⚠️ Images without annotations", "❌ Annotations without images"])
+    tab1, tab2, tab3, tab4 = st.tabs(["✅ Matched", "📊 Most Annotations", "⚠️ Images without annotations", "❌ Annotations without images"])
     
     with tab1:
         st.caption(f"{len(matched_images)} images matched via normalized names")
@@ -317,6 +587,32 @@ if st.session_state.show_annotation_preview:
                 st.markdown(f"✅ `{img_name}` ↔ `{ann_name}` ({ann_count} pts)")
     
     with tab2:
+        st.caption("Images sorted by annotation count (most to least)")
+        # Build list of (image_name, annotation_count) for matched images
+        img_ann_counts = []
+        for img_name in matched_images:
+            norm = normalize_image_name(img_name)
+            ann_name = ann_norm_map.get(norm, "")
+            ann_count = len(st.session_state.points_dict.get(ann_name, []))
+            img_ann_counts.append((img_name, ann_name, ann_count))
+        
+        # Sort by count descending
+        img_ann_counts.sort(key=lambda x: x[2], reverse=True)
+        
+        # Filter by search
+        if search_query:
+            img_ann_counts = [(n, a, c) for n, a, c in img_ann_counts if search_query.lower() in n.lower()]
+        
+        # Show stats
+        if img_ann_counts:
+            counts = [c for _, _, c in img_ann_counts]
+            st.markdown(f"**Max:** {max(counts)} pts | **Min:** {min(counts)} pts | **Avg:** {sum(counts)/len(counts):.1f} pts")
+        
+        for img_name, ann_name, ann_count in img_ann_counts[:100]:
+            bar = "█" * min(ann_count // 5, 20)  # Visual bar, 1 block per 5 points
+            st.markdown(f"`{ann_count:4d}` {bar} `{img_name}`")
+    
+    with tab3:
         st.caption(f"{len(images_without_annotations)} images have no matching annotations")
         items = images_without_annotations
         if search_query:
@@ -325,7 +621,7 @@ if st.session_state.show_annotation_preview:
             norm = normalize_image_name(name)
             st.markdown(f"⚠️ `{name}` (normalized: `{norm}`)")
     
-    with tab3:
+    with tab4:
         st.caption(f"{len(annotations_without_images)} annotation entries have no matching image")
         items = annotations_without_images
         if search_query:
@@ -363,29 +659,66 @@ if not st.session_state.images:
     """)
     st.stop()
 
-# Get images with annotations (using normalized name matching)
-# Build mapping: normalized_name -> original image name
-image_norm_map = {normalize_image_name(name): name for name in st.session_state.images.keys()}
-# Build mapping: normalized_name -> original annotation key
-ann_norm_map = {normalize_image_name(name): name for name in st.session_state.points_dict.keys()}
+# ==================== IMAGE MATCHING ====================
+def rebuild_matching():
+    """Rebuild image-annotation matching using normalized names"""
+    # Build mapping: normalized_name -> original image name
+    image_norm_map = {normalize_image_name(name): name for name in st.session_state.images.keys()}
+    # Build mapping: normalized_name -> original annotation key
+    ann_norm_map = {normalize_image_name(name): name for name in st.session_state.points_dict.keys()}
+    
+    # Find matches via normalized names
+    annotated_images = []
+    norm_to_image = {}  # normalized -> image name
+    norm_to_ann = {}    # normalized -> annotation key
+    for norm_name, img_name in image_norm_map.items():
+        if norm_name in ann_norm_map:
+            annotated_images.append(img_name)
+            norm_to_image[norm_name] = img_name
+            norm_to_ann[norm_name] = ann_norm_map[norm_name]
+    
+    # Store mappings in session state
+    st.session_state.norm_to_ann = norm_to_ann
+    st.session_state.image_norm_map = image_norm_map
+    st.session_state.ann_norm_map = ann_norm_map
+    st.session_state.annotated_images = annotated_images
+    return annotated_images
 
-# Find matches via normalized names
-annotated_images = []
-norm_to_image = {}  # normalized -> image name
-norm_to_ann = {}    # normalized -> annotation key
-for norm_name, img_name in image_norm_map.items():
-    if norm_name in ann_norm_map:
-        annotated_images.append(img_name)
-        norm_to_image[norm_name] = img_name
-        norm_to_ann[norm_name] = ann_norm_map[norm_name]
+# Initial matching or get cached
+if 'annotated_images' not in st.session_state:
+    annotated_images = rebuild_matching()
+else:
+    annotated_images = st.session_state.annotated_images
+    # Ensure mappings exist
+    if 'norm_to_ann' not in st.session_state:
+        annotated_images = rebuild_matching()
 
-# Store mappings in session state for use elsewhere
-st.session_state.norm_to_ann = norm_to_ann
-st.session_state.image_norm_map = image_norm_map
-st.session_state.ann_norm_map = ann_norm_map
+# Matching controls
+all_images = list(st.session_state.images.keys())
+col_match1, col_match2, col_match3 = st.columns([1, 1, 2])
 
-if not annotated_images:
-    st.warning("⚠️ No images have matching annotations. Make sure image filenames in your CSV match uploaded image names (check for double extensions like .JPG.JPG).")
+with col_match1:
+    if st.button("(Re)load images and annotations", help="Re-run matching between uploaded images and CSV `Name` entries"):
+        annotated_images = rebuild_matching()
+        st.toast(f"✅ Matching updated: {len(annotated_images)} of {len(all_images)} images have annotations")
+        st.rerun()
+
+with col_match2:
+    show_all_images = st.checkbox("Show all images", value=False, 
+                                   help="If enabled, you can select images even if they have no matching annotations")
+
+with col_match3:
+    st.caption(f"📊 **{len(annotated_images)}** matched / **{len(all_images)}** total images loaded")
+    st.caption("Matched = an uploaded image filename can be linked to a CSV `Name` (using normalization).")
+
+# Determine which images to show in selection
+selectable_images = all_images if show_all_images else annotated_images
+
+if not selectable_images:
+    if show_all_images:
+        st.warning("⚠️ No images loaded. Upload images in the sidebar.")
+    else:
+        st.warning("⚠️ No images have matching annotations. Try 'Show all images' or check the Preview Annotations panel.")
     st.stop()
 
 # ==================== MODE SELECTION ====================
@@ -401,6 +734,18 @@ st.markdown("---")
 # ==================== TEST MODE ====================
 if mode == "🔬 Test Segmentation":
     
+    with st.expander("ℹ️ How to use Test Segmentation", expanded=False):
+        st.markdown(
+            """
+            Use this mode to validate your settings on **one** image before processing everything.
+ 
+            - Pick an image on the left.
+            - Optionally toggle **Show annotations** to confirm points land on the correct objects.
+            - Click **Visualize** to generate a mask overlay.
+            - If the mask looks wrong, try a different method or adjust the scale settings.
+            """
+        )
+    
     # General settings - Method selection vertical, info and scale on right
     st.subheader("🔧 General Settings")
     col_method, col_info_scale = st.columns([1.2, 2])
@@ -409,7 +754,7 @@ if mode == "🔬 Test Segmentation":
         st.markdown("**Segmentation Method**")
         seg_method = st.radio(
             "Method",
-            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)"],
+            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)"],
             horizontal=False,
             label_visibility="collapsed"
         )
@@ -420,7 +765,13 @@ if mode == "🔬 Test Segmentation":
         with col_info:
             if seg_method == "🔷 Superpixel (SLIC)":
                 with st.expander("ℹ️ How Superpixel works", expanded=False):
-                    st.markdown("""**SLIC Superpixel Segmentation**
+                    st.markdown("""**SLIC Superpixel Segmentation (boundary-respecting regions)**
+
+**Basic idea:** split the image into small, coherent regions (*superpixels*) and spread each point label to its whole region.
+
+**When to use it:**
+- Good default.
+- Works well when object boundaries are visible (coral vs sand vs water) and you want clean edges.
 
 **Scale progression: 3000 → 900 → 30 (DECREASING)**
 
@@ -437,7 +788,13 @@ The number represents **how many superpixels** to create:
             
             elif seg_method == "🎯 Adaptive (Density-based)":
                 with st.expander("ℹ️ How Adaptive works", expanded=False):
-                    st.markdown("""**Adaptive Density-Based Segmentation**
+                    st.markdown("""**Adaptive (density-based) Segmentation (gap-filling from points)**
+
+**Basic idea:** use the sparse points as seeds and grow regions outward (watershed-style). Areas with more points tend to get more detailed boundaries.
+
+**When to use it:**
+- When annotations are uneven (some dense areas, some sparse) and you want the algorithm to fill gaps.
+- Often good when superpixels under-segment or leave holes.
 
 **Scale progression: 1.0 → 0.5 → 0.25 (DECREASING resolution)**
 
@@ -450,9 +807,15 @@ At lower resolution, watershed creates segments relative to the smaller image. W
 
 **Can overwrite:** If enabled and a finer scale has high confidence, it can refine boundaries.""")
             
-            else:  # Graph-based
+            elif seg_method == "📊 Graph-based (Felzenszwalb)":
                 with st.expander("ℹ️ How Graph-based works", expanded=False):
-                    st.markdown("""**Felzenszwalb Graph-Based Segmentation**
+                    st.markdown("""**Graph-based (Felzenszwalb) Segmentation (merge-by-similarity)**
+
+**Basic idea:** build a graph of pixels, then merge neighboring pixels/regions if they look similar. This often creates natural regions without requiring a fixed grid.
+
+**When to use it:**
+- If you want segments that follow texture/color similarity.
+- Useful when superpixels are too regular or adaptive watershed feels too aggressive.
 
 **Scale progression: 100 → 300 → 1000 (INCREASING)**
 
@@ -461,6 +824,23 @@ The number is a **similarity threshold** for merging regions:
 - **Higher number (1000)** = Loose merging = **Few large segments**
 
 **Can overwrite:** If enabled and a coarser scale has high confidence, it can correct over-segmentation.""")
+            
+            else:  # Hybrid
+                with st.expander("ℹ️ How Hybrid works", expanded=False):
+                    st.markdown("""**Hybrid Segmentation (SLIC + Felzenszwalb combined)**
+
+**Basic idea:** Mix both methods! Each round can be either Superpixel (SLIC) or Graph-based, giving you full control.
+
+**When to use it:**
+- When you want the best of both worlds
+- Start with SLIC for clean boundaries, then use Graph for texture-based filling (or vice versa)
+
+**How to configure:**
+- For each round, pick **S** (Superpixel) or **G** (Graph)
+- **S rounds:** Number = superpixel count (higher = smaller regions)
+- **G rounds:** Number = merge threshold (higher = larger regions)
+
+**Example:** S:3000 → G:500 → S:100 = Start precise with SLIC, fill gaps with Graph, then coarse SLIC pass.""")
         
         with col_scale_inner:
             scale_factor = st.slider("Processing Scale", 0.1, 1.0, st.session_state.custom_defaults['scale_factor'], 0.05,
@@ -478,7 +858,7 @@ The number is a **similarity threshold** for merging regions:
     # LEFT: Image selection and preview
     with col_left:
         st.markdown("**🖼️ Select Image**")
-        test_image = st.selectbox("Image", annotated_images, label_visibility="collapsed")
+        test_image = st.selectbox("Image", selectable_images, label_visibility="collapsed")
         
         total_points_in_image = 0
         points_df = None
@@ -551,72 +931,222 @@ The number is a **similarity threshold** for merging regions:
     with col_mid:
         st.markdown("**⚙️ Parameters**")
         
+        # Number of rounds selector
+        num_rounds = st.slider("Rounds", 1, 4, st.session_state.custom_defaults['num_rounds'], 1,
+            help="More rounds = better coverage but slower")
+        
+        # Adapt values toggle
+        use_smart = st.toggle("Adapt values", value=True, key="test_smart",
+            help="Auto-adjust for processing scale")
+        
+        # Get method key
         if seg_method == "🔷 Superpixel (SLIC)":
-            scale_1 = st.number_input("Scale 1 (many small)", 100, 10000, st.session_state.custom_defaults['superpixel'][0], 100,
-                help="First pass: many small superpixels for fine detail. Higher = smaller regions.")
-            scale_2 = st.number_input("Scale 2 (medium)", 10, 5000, st.session_state.custom_defaults['superpixel'][1], 10,
-                help="Second pass: medium superpixels to fill gaps.")
-            scale_3 = st.number_input("Scale 3 (few large)", 10, 1000, st.session_state.custom_defaults['superpixel'][2], 10,
-                help="Final pass: few large superpixels for complete coverage.")
+            method_key = "superpixel"
+            options = LOG_OPTIONS_10K
+        elif seg_method == "🎯 Adaptive (Density-based)":
+            method_key = "adaptive"
+            options = AD_OPTIONS
+        elif seg_method == "📊 Graph-based (Felzenszwalb)":
+            method_key = "graph"
+            options = LOG_OPTIONS_5K
+        else:  # Hybrid
+            method_key = "hybrid"
+            options = LOG_OPTIONS_10K  # Will be dynamic per round
+        
+        # Initialize base values (persistent, at 100% scale)
+        base_values = init_base_values("test", method_key, num_rounds)
+        
+        # Derive display values from base values
+        display_values = get_display_values(base_values, scale_factor, method_key, use_smart, options)
+        
+        # Track scale changes - when adapt is ON and scale changes, update widget keys BEFORE widget creation
+        test_scale_track = "test_last_scale_track"
+        if test_scale_track not in st.session_state:
+            st.session_state[test_scale_track] = scale_factor
+        
+        if use_smart and st.session_state[test_scale_track] != scale_factor and method_key != "hybrid":
+            st.session_state[test_scale_track] = scale_factor
+            # Pre-set widget keys to new display values (before widgets are created)
+            prefixes = {"superpixel": "test_sp_", "adaptive": "test_ad_", "graph": "test_gr_"}
+            prefix = prefixes[method_key]
+            for i in range(num_rounds):
+                st.session_state[f"{prefix}{i}"] = display_values[i]
+        
+        st.caption(f"{'Adapted' if use_smart else 'Manual'} ({scale_factor*100:.0f}% scale)")
+        
+        if seg_method == "🔷 Superpixel (SLIC)":
+            scale_values = []
+            for i in range(num_rounds):
+                # Create callback to update base value when slider changes
+                def make_callback(idx, mkey, pscale, adapt):
+                    def cb():
+                        widget_key = f"test_sp_{idx}"
+                        if widget_key in st.session_state:
+                            update_base_from_display("test", mkey, idx, st.session_state[widget_key], pscale, adapt)
+                    return cb
+                
+                val = st.select_slider(
+                    f"Round {i+1}", 
+                    options=LOG_OPTIONS_10K, 
+                    value=display_values[i], 
+                    key=f"test_sp_{i}",
+                    on_change=make_callback(i, method_key, scale_factor, use_smart)
+                )
+                scale_values.append(val)
             
-            if st.button("💾 Save", key="save_sp", use_container_width=True, help="Save these values as your defaults"):
-                st.session_state.custom_defaults['superpixel'] = [scale_1, scale_2, scale_3]
-                st.toast(f"✓ Saved [{scale_1}, {scale_2}, {scale_3}] as new defaults")
-            
-            seg_params = {'scales': [scale_1, scale_2, scale_3]}
+            seg_params = {'scales': scale_values}
             
         elif seg_method == "🎯 Adaptive (Density-based)":
-            as1 = st.slider("Scale 1 (coarse)", 0.1, 1.0, st.session_state.custom_defaults['adaptive'][0], 0.1,
-                help="Full resolution creates larger segments.")
-            as2 = st.slider("Scale 2 (medium)", 0.1, 1.0, st.session_state.custom_defaults['adaptive'][1], 0.1,
-                help="Half resolution for medium segments.")
-            as3 = st.slider("Scale 3 (fine)", 0.1, 1.0, st.session_state.custom_defaults['adaptive'][2], 0.05,
-                help="Quarter resolution for fine gap-filling.")
+            scale_values = []
+            for i in range(num_rounds):
+                def make_callback(idx, mkey, pscale, adapt):
+                    def cb():
+                        widget_key = f"test_ad_{idx}"
+                        if widget_key in st.session_state:
+                            update_base_from_display("test", mkey, idx, st.session_state[widget_key], pscale, adapt)
+                    return cb
+                
+                val = st.select_slider(
+                    f"Round {i+1}", 
+                    options=AD_OPTIONS, 
+                    value=display_values[i], 
+                    key=f"test_ad_{i}",
+                    format_func=lambda x: f"{x:.2f}",
+                    on_change=make_callback(i, method_key, scale_factor, use_smart)
+                )
+                scale_values.append(val)
             
-            with st.expander("⚙️ Advanced"):
-                min_dist = st.slider("Min segment distance", 5, 50, st.session_state.custom_defaults['adaptive_min_dist'], 5,
-                    help="Minimum pixels between watershed seeds.")
-                density_thresh = st.slider("Density threshold", 1, 20, st.session_state.custom_defaults['adaptive_density'], 1,
-                    help="Points needed for 'dense' area treatment.")
-                allow_ow = st.checkbox("Allow overwriting", value=False,
-                    help="Let later scales overwrite earlier labels if confident.")
-            
-            if st.button("💾 Save", key="save_ad", use_container_width=True, help="Save these values as your defaults"):
-                st.session_state.custom_defaults['adaptive'] = [as1, as2, as3]
-                st.session_state.custom_defaults['adaptive_min_dist'] = min_dist
-                st.session_state.custom_defaults['adaptive_density'] = density_thresh
-                st.toast(f"✓ Saved adaptive settings as new defaults")
+            with st.expander("⚙️ Advanced", expanded=False):
+                min_dist = st.slider("Min dist", 1, 50, st.session_state.custom_defaults['adaptive_min_dist'], 1)
+                density_thresh = st.slider("Density", 1, 20, st.session_state.custom_defaults['adaptive_density'], 1)
+                allow_ow = st.checkbox("Overwrite", value=False, key="ad_ow")
             
             seg_params = {
-                'scales': [as1, as2, as3],
-                'min_distance': min_dist if 'min_dist' in dir() else 10,
-                'density_threshold': density_thresh if 'density_thresh' in dir() else 5,
-                'allow_overwrite': allow_ow if 'allow_ow' in dir() else False
+                'scales': scale_values,
+                'min_distance': min_dist,
+                'density_threshold': density_thresh,
+                'allow_overwrite': allow_ow
             }
             
-        else:  # Graph-based
-            gs1 = st.number_input("Scale 1 (fine)", 10, 500, st.session_state.custom_defaults['graph'][0], 10,
-                help="Low threshold = strict merging = many small segments.")
-            gs2 = st.number_input("Scale 2 (medium)", 50, 1000, st.session_state.custom_defaults['graph'][1], 50,
-                help="Medium threshold for gap filling.")
-            gs3 = st.number_input("Scale 3 (coarse)", 100, 5000, st.session_state.custom_defaults['graph'][2], 100,
-                help="High threshold = loose merging = complete coverage.")
+        elif seg_method == "📊 Graph-based (Felzenszwalb)":
+            scale_values = []
+            for i in range(num_rounds):
+                def make_callback(idx, mkey, pscale, adapt):
+                    def cb():
+                        widget_key = f"test_gr_{idx}"
+                        if widget_key in st.session_state:
+                            update_base_from_display("test", mkey, idx, st.session_state[widget_key], pscale, adapt)
+                    return cb
+                
+                val = st.select_slider(
+                    f"Round {i+1}", 
+                    options=LOG_OPTIONS_5K, 
+                    value=display_values[i], 
+                    key=f"test_gr_{i}",
+                    on_change=make_callback(i, method_key, scale_factor, use_smart)
+                )
+                scale_values.append(val)
             
-            with st.expander("⚙️ Advanced"):
-                g_allow_ow = st.checkbox("Allow overwriting", value=False, key="g_ow",
-                    help="Let later scales overwrite earlier labels if confident.")
-            
-            if st.button("💾 Save", key="save_gr", use_container_width=True, help="Save these values as your defaults"):
-                st.session_state.custom_defaults['graph'] = [gs1, gs2, gs3]
-                st.toast(f"✓ Saved [{gs1}, {gs2}, {gs3}] as new defaults")
+            with st.expander("⚙️ Advanced", expanded=False):
+                g_allow_ow = st.checkbox("Overwrite", value=False, key="gr_ow")
             
             seg_params = {
-                'scales': [gs1, gs2, gs3],
-                'allow_overwrite': g_allow_ow if 'g_allow_ow' in dir() else False
+                'scales': scale_values,
+                'allow_overwrite': g_allow_ow
             }
         
-        st.markdown("---")
+        else:  # Hybrid
+            st.caption("**S** = Superpixel (count), **G** = Graph (threshold)")
+            round_configs = []
+            
+            # Clear any cached values that might be invalid
+            for i in range(4):
+                for key in [f"test_hybrid_s_{i}", f"test_hybrid_g_{i}"]:
+                    if key in st.session_state:
+                        val = st.session_state[key]
+                        if key.endswith(f"s_{i}") and val not in LOG_OPTIONS_10K:
+                            del st.session_state[key]
+                        elif key.endswith(f"g_{i}") and val not in LOG_OPTIONS_5K:
+                            del st.session_state[key]
+            
+            for i in range(num_rounds):
+                col_type, col_val = st.columns([1, 2])
+                
+                with col_type:
+                    round_type = st.radio(
+                        f"R{i+1}",
+                        ["S", "G"],
+                        horizontal=True,
+                        key=f"test_hybrid_type_{i}",
+                        label_visibility="collapsed"
+                    )
+                
+                with col_val:
+                    if round_type == "S":
+                        # Superpixel: higher = smaller regions
+                        # Defaults: 3000 → 1000 → 100
+                        val = st.select_slider(
+                            f"Round {i+1}",
+                            options=LOG_OPTIONS_10K,
+                            value=3000 if i == 0 else (1000 if i == 1 else 100),
+                            key=f"test_hybrid_s_{i}",
+                            label_visibility="collapsed"
+                        )
+                    else:
+                        # Graph: higher = larger regions
+                        # Defaults: 100 → 300 → 1000
+                        val = st.select_slider(
+                            f"Round {i+1}",
+                            options=LOG_OPTIONS_5K,
+                            value=100 if i == 0 else (300 if i == 1 else 1000),
+                            key=f"test_hybrid_g_{i}",
+                            label_visibility="collapsed"
+                        )
+                
+                round_configs.append({
+                    'type': 'superpixel' if round_type == 'S' else 'graph',
+                    'value': val
+                })
+            
+            with st.expander("⚙️ Advanced", expanded=False):
+                h_allow_ow = st.checkbox("Overwrite", value=False, key="hybrid_ow")
+            
+            seg_params = {
+                'round_configs': round_configs,
+                'allow_overwrite': h_allow_ow
+            }
+        
+        # Confidence filtering (optional)
+        conf_enabled = st.checkbox(
+            "Enable confidence filtering (slower)", value=False, key="conf_enabled",
+            help="Adds extra processing time but lets you filter uncertain segments in the result."
+        )
+        if conf_enabled:
+            conf_threshold = st.slider(
+                "Confidence threshold", 0, 100, 40, 5, key="conf_threshold",
+                help="Hide regions with confidence below this value"
+            )
+        else:
+            conf_threshold = 0
+            st.caption("Confidence filtering is OFF (faster). Turn it on to filter uncertain regions; it will add noticeable processing time.")
+
         run_viz = st.button("🎨 Visualize", type="primary", use_container_width=True)
+        
+        # Export settings button
+        if seg_method == "🔀 Hybrid (SLIC + Graph)":
+            # For hybrid, format round_configs as scale_values for export
+            hybrid_scale_values = [f"{c['type'][0].upper()}:{c['value']}" for c in round_configs]
+            settings_txt = format_settings_txt(seg_method, scale_factor, num_rounds, hybrid_scale_values, seg_params, use_smart, conf_threshold, conf_enabled)
+        else:
+            settings_txt = format_settings_txt(seg_method, scale_factor, num_rounds, scale_values, seg_params, use_smart, conf_threshold, conf_enabled)
+        st.download_button(
+            "💾 Export Settings",
+            settings_txt,
+            file_name="segmentation_settings.txt",
+            mime="text/plain",
+            use_container_width=True,
+            help="Save current settings to a .txt file"
+        )
     
     # RIGHT: Result
     with col_right:
@@ -631,6 +1161,39 @@ The number is a **similarity threshold** for merging regions:
         if has_result:
             result = st.session_state.test_result
             
+            # Confidence threshold slider (only if enabled)
+            conf_summary = result.get('confidence_summary', {})
+            if conf_enabled:
+                conf_col1, conf_col2 = st.columns([2, 1])
+                with conf_col1:
+                    conf_threshold = st.slider(
+                        "Confidence threshold", 0, 100, conf_threshold, 5,
+                        help="Hide regions with confidence below this value"
+                    )
+                with conf_col2:
+                    if conf_summary:
+                        st.caption(f"Range: {conf_summary.get('min', 0):.0f}-{conf_summary.get('max', 0):.0f} | Avg: {conf_summary.get('mean', 0):.0f}")
+            else:
+                conf_threshold = 0
+                if conf_summary:
+                    st.caption("Confidence filtering is off. Enable it in the left panel to filter uncertain regions (slower).")
+            
+            # Apply confidence filtering
+            final_mask = result['final_mask']
+            confidence_map = result.get('confidence_map')
+            if conf_enabled and confidence_map is not None and conf_threshold > 0:
+                filtered_mask = apply_confidence_threshold(final_mask, confidence_map, conf_threshold)
+            else:
+                filtered_mask = final_mask
+            
+            # Rebuild colored mask with filtering
+            colored_mask = np.zeros((*filtered_mask.shape, 3), dtype=np.uint8)
+            for entry in st.session_state.labelset:
+                class_id = int(entry['Count'])
+                color_code = entry['Color Code']
+                if isinstance(color_code, list):
+                    colored_mask[filtered_mask == class_id] = color_code
+            
             # Opacity slider
             mask_opacity = st.slider("Overlay strength", 0, 100, 60, 5)
             mask_alpha = mask_opacity / 100.0
@@ -638,7 +1201,7 @@ The number is a **similarity threshold** for merging regions:
             # Compute overlay
             overlay = cv2.addWeighted(
                 result['base_rgb'], 1.0 - mask_alpha,
-                result['colored_mask'], mask_alpha, 0
+                colored_mask, mask_alpha, 0
             )
             
             # Resize and display
@@ -649,13 +1212,17 @@ The number is a **similarity threshold** for merging regions:
             # Image + Legend side by side
             img_col, legend_col = st.columns([3, 1.2], gap="small")
             with img_col:
-                st.image(result_display, caption=f"Coverage: {result['coverage']:.1f}%")
+                # Show filtered coverage
+                filtered_coverage = (filtered_mask > 0).sum() / filtered_mask.size * 100
+                if conf_threshold > 0:
+                    st.image(result_display, caption=f"Coverage: {filtered_coverage:.1f}% (filtered from {result['coverage']:.1f}%)")
+                else:
+                    st.image(result_display, caption=f"Coverage: {result['coverage']:.1f}%")
             with legend_col:
-                final_mask = result['final_mask']
-                labeled_pixels = (final_mask > 0).sum()
+                labeled_pixels = (filtered_mask > 0).sum()
                 if labeled_pixels > 0:
                     with st.expander("Legend", expanded=False):
-                        unique_ids, counts = np.unique(final_mask, return_counts=True)
+                        unique_ids, counts = np.unique(filtered_mask, return_counts=True)
                         mask_counts = dict(zip(unique_ids.tolist(), counts.tolist()))
                         
                         rows = []
@@ -716,11 +1283,26 @@ The number is a **similarity threshold** for merging regions:
                         density_threshold=seg_params.get('density_threshold', 5),
                         allow_overwrite=seg_params.get('allow_overwrite', False)
                     )
-                else:
+                elif seg_method == "📊 Graph-based (Felzenszwalb)":
                     final_mask, intermediate = multi_scale_graph_labeling(
                         scaled_image, scaled_points, st.session_state.labelset, seg_params['scales'],
                         allow_overwrite=seg_params.get('allow_overwrite', False)
                     )
+                else:  # Hybrid
+                    final_mask, intermediate = multi_scale_hybrid_labeling(
+                        scaled_image, scaled_points, st.session_state.labelset,
+                        seg_params['round_configs'],
+                        allow_overwrite=seg_params.get('allow_overwrite', False)
+                    )
+                
+                # Calculate confidence scores only if enabled
+                if conf_enabled:
+                    confidence_map, region_stats = calculate_region_confidence(
+                        final_mask, scaled_points, st.session_state.labelset
+                    )
+                    confidence_summary = get_confidence_summary(region_stats)
+                else:
+                    confidence_map, region_stats, confidence_summary = None, {}, {}
                 
                 # Create colored mask
                 image_rgb = cv2.cvtColor(scaled_image, cv2.COLOR_BGR2RGB)
@@ -739,6 +1321,10 @@ The number is a **similarity threshold** for merging regions:
                     'base_rgb': image_rgb,
                     'colored_mask': colored_mask,
                     'final_mask': final_mask,
+                    'confidence_map': confidence_map,
+                    'region_stats': region_stats,
+                    'confidence_summary': confidence_summary,
+                    'scaled_points': scaled_points,
                     'intermediate': intermediate,
                     'scaled_image': scaled_image,
                     'coverage': coverage
@@ -834,51 +1420,302 @@ A single segmentation pass would leave large gaps between annotation points. By 
 else:
     st.subheader("📦 Export to COCO")
     
+    with st.expander("ℹ️ How to use Export COCO", expanded=False):
+        st.markdown(
+            """
+            Use this mode when you're happy with the method/settings and want to process **many images**.
+ 
+            1. Select images (use **Select All** if you want everything).
+            2. Pick a segmentation method and scale settings.
+            3. Click **Process All Images**.
+            4. Download **COCO JSON** and upload it to Roboflow.
+ 
+            Tip: if you see only a few selectable images, enable **Show all images** above, or click **Match images and annotations**.
+            """
+        )
+    
     # Settings
     col_select, col_method, col_params = st.columns([1, 1.2, 1.2])
     
     with col_select:
         st.markdown("**Image Selection**")
+        
+        # Select all button
+        col_sel_btn1, col_sel_btn2 = st.columns(2)
+        with col_sel_btn1:
+            if st.button("Select All", key="select_all"):
+                st.session_state.export_selection = selectable_images
+                st.rerun()
+        with col_sel_btn2:
+            if st.button("Clear All", key="clear_all"):
+                st.session_state.export_selection = []
+                st.rerun()
+        
+        # Get default selection
+        default_sel = st.session_state.get('export_selection', selectable_images[:min(3, len(selectable_images))])
+        # Filter to only valid images
+        default_sel = [img for img in default_sel if img in selectable_images]
+        
         selected = st.multiselect(
-            "Select images", annotated_images, default=annotated_images[:min(3, len(annotated_images))],
+            "Select images", selectable_images, default=default_sel,
             label_visibility="collapsed"
         )
-        st.caption(f"{len(selected)} images selected")
+        st.session_state.export_selection = selected
+        st.caption(f"{len(selected)} / {len(selectable_images)} images selected")
     
     with col_method:
         st.markdown("**Segmentation Method**")
         seg_method = st.radio(
             "Method",
-            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)"],
+            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)"],
             key="export_method", label_visibility="collapsed"
         )
+        if seg_method == "🔷 Superpixel (SLIC)":
+            st.caption("Superpixels: split into regions first, then spread point labels to whole regions. Usually a good default.")
+        elif seg_method == "🎯 Adaptive (Density-based)":
+            st.caption("Adaptive: grows regions from points to fill gaps; can be better when points are sparse/uneven.")
+        elif seg_method == "📊 Graph-based (Felzenszwalb)":
+            st.caption("Graph-based: merges pixels by similarity; can follow natural texture/color boundaries.")
+        else:
+            st.caption("Hybrid: mix SLIC and Graph methods per round for maximum control.")
+        
+        with st.expander("ℹ️ Method details (what it does / when to use)", expanded=False):
+            if seg_method == "🔷 Superpixel (SLIC)":
+                st.markdown(
+                    """**SLIC Superpixels**
+
+                    - **What it does:** breaks the image into many small regions (superpixels) that try to follow edges.
+                    - **How labels spread:** each point label is assigned to its local region; multiple scales fill remaining gaps.
+                    - **When to use:** best default when boundaries are visually clear.
+                    """
+                )
+            elif seg_method == "🎯 Adaptive (Density-based)":
+                st.markdown(
+                    """**Adaptive (density-based / watershed-like growth)**
+
+                    - **What it does:** grows regions outward from your sparse points.
+                    - **Why it helps:** can fill larger gaps when points are sparse.
+                    - **When to use:** when Superpixels leave holes or when point density varies a lot.
+                    """
+                )
+            elif seg_method == "📊 Graph-based (Felzenszwalb)":
+                st.markdown(
+                    """**Graph-based (Felzenszwalb)**
+
+                    - **What it does:** merges pixels/regions based on similarity (color/texture) to form natural segments.
+                    - **When to use:** when you want segments that follow texture/color patterns rather than a fixed grid.
+                    """
+                )
+            else:
+                st.markdown(
+                    """**Hybrid (SLIC + Graph combined)**
+
+                    - **What it does:** each round can be either Superpixel or Graph-based.
+                    - **S rounds:** number = superpixel count (higher = smaller regions)
+                    - **G rounds:** number = merge threshold (higher = larger regions)
+                    - **When to use:** when you want to combine the strengths of both methods.
+                    """
+                )
     
     with col_params:
         st.markdown("**Parameters**")
-        scale_factor = st.slider("Processing Scale", 0.1, 1.0, st.session_state.custom_defaults['scale_factor'], 0.1, key="export_scale")
+        exp_scale_factor = st.slider("Scale", 0.1, 1.0, st.session_state.custom_defaults['scale_factor'], 0.1,
+            key="export_scale", help="Lower = faster but less detail")
+        
+        exp_num_rounds = st.slider("Rounds", 1, 4, st.session_state.custom_defaults['num_rounds'], 1, key="exp_rounds")
+        exp_use_smart = st.toggle("Adapt values", value=True, key="exp_smart", help="Auto-adjust for scale")
+        
+        # Get method key
+        if seg_method == "🔷 Superpixel (SLIC)":
+            exp_method_key = "superpixel"
+            exp_options = LOG_OPTIONS_10K
+        elif seg_method == "🎯 Adaptive (Density-based)":
+            exp_method_key = "adaptive"
+            exp_options = AD_OPTIONS
+        elif seg_method == "📊 Graph-based (Felzenszwalb)":
+            exp_method_key = "graph"
+            exp_options = LOG_OPTIONS_5K
+        else:  # Hybrid
+            exp_method_key = "hybrid"
+            exp_options = LOG_OPTIONS_10K
+        
+        # Initialize base values (persistent, at 100% scale)
+        exp_base_values = init_base_values("exp", exp_method_key, exp_num_rounds)
+        
+        # Derive display values from base values
+        exp_display_values = get_display_values(exp_base_values, exp_scale_factor, exp_method_key, exp_use_smart, exp_options)
+        
+        # Track scale changes - when adapt is ON and scale changes, update widget keys BEFORE widget creation
+        exp_scale_track = "exp_last_scale_track"
+        if exp_scale_track not in st.session_state:
+            st.session_state[exp_scale_track] = exp_scale_factor
+        
+        if exp_use_smart and st.session_state[exp_scale_track] != exp_scale_factor and exp_method_key != "hybrid":
+            st.session_state[exp_scale_track] = exp_scale_factor
+            # Pre-set widget keys to new display values (before widgets are created)
+            prefixes = {"superpixel": "exp_sp_", "adaptive": "exp_ad_", "graph": "exp_gr_"}
+            prefix = prefixes[exp_method_key]
+            for i in range(exp_num_rounds):
+                st.session_state[f"{prefix}{i}"] = exp_display_values[i]
+        
+        st.caption(f"{'Adapted' if exp_use_smart else 'Manual'} ({exp_scale_factor*100:.0f}%)")
         
         if seg_method == "🔷 Superpixel (SLIC)":
-            with st.expander("⚙️ Scale Settings", expanded=False):
-                exp_s1 = st.number_input("Scale 1 (many small)", 100, 10000, st.session_state.custom_defaults['superpixel'][0], 100, key="exp_sp1")
-                exp_s2 = st.number_input("Scale 2 (medium)", 10, 5000, st.session_state.custom_defaults['superpixel'][1], 10, key="exp_sp2")
-                exp_s3 = st.number_input("Scale 3 (few large)", 10, 1000, st.session_state.custom_defaults['superpixel'][2], 10, key="exp_sp3")
-            seg_params = {'scales': [exp_s1, exp_s2, exp_s3]}
+            exp_scale_values = []
+            for i in range(exp_num_rounds):
+                def make_exp_callback(idx, mkey, pscale, adapt):
+                    def cb():
+                        widget_key = f"exp_sp_{idx}"
+                        if widget_key in st.session_state:
+                            update_base_from_display("exp", mkey, idx, st.session_state[widget_key], pscale, adapt)
+                    return cb
+                
+                val = st.select_slider(
+                    f"Round {i+1}", 
+                    options=LOG_OPTIONS_10K, 
+                    value=exp_display_values[i], 
+                    key=f"exp_sp_{i}",
+                    on_change=make_exp_callback(i, exp_method_key, exp_scale_factor, exp_use_smart)
+                )
+                exp_scale_values.append(val)
+            seg_params = {'scales': exp_scale_values}
+            
         elif seg_method == "🎯 Adaptive (Density-based)":
-            with st.expander("⚙️ Scale Settings", expanded=False):
-                exp_as1 = st.slider("Scale 1 (coarse)", 0.1, 1.0, st.session_state.custom_defaults['adaptive'][0], 0.1, key="exp_ad1")
-                exp_as2 = st.slider("Scale 2 (medium)", 0.1, 1.0, st.session_state.custom_defaults['adaptive'][1], 0.1, key="exp_ad2")
-                exp_as3 = st.slider("Scale 3 (fine)", 0.1, 1.0, st.session_state.custom_defaults['adaptive'][2], 0.05, key="exp_ad3")
-                exp_min_dist = st.slider("Min segment distance", 5, 50, st.session_state.custom_defaults['adaptive_min_dist'], 5, key="exp_min_dist")
-                exp_density = st.slider("Density threshold", 1, 20, st.session_state.custom_defaults['adaptive_density'], 1, key="exp_density")
-                exp_allow_ow = st.checkbox("Allow overwriting", value=False, key="exp_allow_ow_ad")
-            seg_params = {'scales': [exp_as1, exp_as2, exp_as3], 'min_distance': exp_min_dist, 'density_threshold': exp_density, 'allow_overwrite': exp_allow_ow}
+            exp_scale_values = []
+            for i in range(exp_num_rounds):
+                def make_exp_callback(idx, mkey, pscale, adapt):
+                    def cb():
+                        widget_key = f"exp_ad_{idx}"
+                        if widget_key in st.session_state:
+                            update_base_from_display("exp", mkey, idx, st.session_state[widget_key], pscale, adapt)
+                    return cb
+                
+                val = st.select_slider(
+                    f"Round {i+1}", 
+                    options=AD_OPTIONS, 
+                    value=exp_display_values[i], 
+                    key=f"exp_ad_{i}",
+                    format_func=lambda x: f"{x:.2f}",
+                    on_change=make_exp_callback(i, exp_method_key, exp_scale_factor, exp_use_smart)
+                )
+                exp_scale_values.append(val)
+            with st.expander("⚙️ Advanced", expanded=False):
+                exp_min_dist = st.slider("Min dist", 1, 50, st.session_state.custom_defaults['adaptive_min_dist'], 1, key="exp_min_dist")
+                exp_density = st.slider("Density", 1, 20, st.session_state.custom_defaults['adaptive_density'], 1, key="exp_density")
+                exp_allow_ow = st.checkbox("Overwrite", value=False, key="exp_allow_ow_ad")
+            seg_params = {'scales': exp_scale_values, 'min_distance': exp_min_dist, 'density_threshold': exp_density, 'allow_overwrite': exp_allow_ow}
+            
+        elif seg_method == "📊 Graph-based (Felzenszwalb)":
+            exp_scale_values = []
+            for i in range(exp_num_rounds):
+                def make_exp_callback(idx, mkey, pscale, adapt):
+                    def cb():
+                        widget_key = f"exp_gr_{idx}"
+                        if widget_key in st.session_state:
+                            update_base_from_display("exp", mkey, idx, st.session_state[widget_key], pscale, adapt)
+                    return cb
+                
+                val = st.select_slider(
+                    f"Round {i+1}", 
+                    options=LOG_OPTIONS_5K, 
+                    value=exp_display_values[i], 
+                    key=f"exp_gr_{i}",
+                    on_change=make_exp_callback(i, exp_method_key, exp_scale_factor, exp_use_smart)
+                )
+                exp_scale_values.append(val)
+            with st.expander("⚙️ Advanced", expanded=False):
+                exp_allow_ow_g = st.checkbox("Overwrite", value=False, key="exp_allow_ow_g")
+            seg_params = {'scales': exp_scale_values, 'allow_overwrite': exp_allow_ow_g}
+        
+        else:  # Hybrid
+            st.caption("**S** = Superpixel (count), **G** = Graph (threshold)")
+            exp_round_configs = []
+            
+            # Clear any cached values that might be invalid
+            for i in range(4):
+                for key in [f"exp_hybrid_s_{i}", f"exp_hybrid_g_{i}"]:
+                    if key in st.session_state:
+                        val = st.session_state[key]
+                        if key.endswith(f"s_{i}") and val not in LOG_OPTIONS_10K:
+                            del st.session_state[key]
+                        elif key.endswith(f"g_{i}") and val not in LOG_OPTIONS_5K:
+                            del st.session_state[key]
+            
+            for i in range(exp_num_rounds):
+                col_type, col_val = st.columns([1, 2])
+                
+                with col_type:
+                    exp_round_type = st.radio(
+                        f"R{i+1}",
+                        ["S", "G"],
+                        horizontal=True,
+                        key=f"exp_hybrid_type_{i}",
+                        label_visibility="collapsed"
+                    )
+                
+                with col_val:
+                    if exp_round_type == "S":
+                        # Defaults: 3000 → 1000 → 100
+                        exp_val = st.select_slider(
+                            f"Round {i+1}",
+                            options=LOG_OPTIONS_10K,
+                            value=3000 if i == 0 else (1000 if i == 1 else 100),
+                            key=f"exp_hybrid_s_{i}",
+                            label_visibility="collapsed"
+                        )
+                    else:
+                        # Defaults: 100 → 300 → 1000
+                        exp_val = st.select_slider(
+                            f"Round {i+1}",
+                            options=LOG_OPTIONS_5K,
+                            value=100 if i == 0 else (300 if i == 1 else 1000),
+                            key=f"exp_hybrid_g_{i}",
+                            label_visibility="collapsed"
+                        )
+                
+                exp_round_configs.append({
+                    'type': 'superpixel' if exp_round_type == 'S' else 'graph',
+                    'value': exp_val
+                })
+            
+            with st.expander("⚙️ Advanced", expanded=False):
+                exp_h_allow_ow = st.checkbox("Overwrite", value=False, key="exp_hybrid_ow")
+            
+            seg_params = {
+                'round_configs': exp_round_configs,
+                'allow_overwrite': exp_h_allow_ow
+            }
+        
+        # Confidence filtering (optional for export)
+        exp_conf_enabled = st.checkbox(
+            "Enable confidence filtering (slower)", value=False, key="exp_conf_enabled",
+            help="Adds extra processing time but lets you filter uncertain segments before export."
+        )
+        if exp_conf_enabled:
+            exp_conf_threshold = st.slider(
+                "Confidence threshold", 0, 100, 40, 5,
+                key="exp_conf_threshold",
+                help="Exclude regions with confidence below this value from export"
+            )
         else:
-            with st.expander("⚙️ Scale Settings", expanded=False):
-                exp_g1 = st.number_input("Scale 1 (fine)", 10, 500, st.session_state.custom_defaults['graph'][0], 10, key="exp_g1")
-                exp_g2 = st.number_input("Scale 2 (medium)", 50, 1000, st.session_state.custom_defaults['graph'][1], 50, key="exp_g2")
-                exp_g3 = st.number_input("Scale 3 (coarse)", 100, 5000, st.session_state.custom_defaults['graph'][2], 100, key="exp_g3")
-                exp_allow_ow_g = st.checkbox("Allow overwriting", value=False, key="exp_allow_ow_g")
-            seg_params = {'scales': [exp_g1, exp_g2, exp_g3], 'allow_overwrite': exp_allow_ow_g}
+            exp_conf_threshold = 0
+            st.caption("Confidence filtering is OFF (faster). Turn it on to filter uncertain regions; it will add noticeable processing time.")
+        
+        # Export settings button
+        if seg_method == "🔀 Hybrid (SLIC + Graph)":
+            exp_hybrid_scale_values = [f"{c['type'][0].upper()}:{c['value']}" for c in exp_round_configs]
+            exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, exp_num_rounds, exp_hybrid_scale_values, seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled)
+        else:
+            exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, exp_num_rounds, exp_scale_values, seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled)
+        st.download_button(
+            "💾 Export Settings",
+            exp_settings_txt,
+            file_name="segmentation_settings.txt",
+            mime="text/plain",
+            use_container_width=True,
+            key="exp_settings_download",
+            help="Save current settings to a .txt file"
+        )
     
     st.markdown("---")
     
@@ -905,7 +1742,7 @@ else:
                     ann_key = st.session_state.norm_to_ann.get(norm_name, image_name)
                     points_df = st.session_state.points_dict[ann_key]
                     
-                    scaled_image, scaled_points = scale_image_and_points(image, points_df, scale_factor)
+                    scaled_image, scaled_points = scale_image_and_points(image, points_df, exp_scale_factor)
                     
                     if seg_method == "🔷 Superpixel (SLIC)":
                         final_mask, _ = multi_scale_labeling(
@@ -918,11 +1755,24 @@ else:
                             density_threshold=seg_params.get('density_threshold', 5),
                             allow_overwrite=seg_params.get('allow_overwrite', False)
                         )
-                    else:
+                    elif seg_method == "📊 Graph-based (Felzenszwalb)":
                         final_mask, _ = multi_scale_graph_labeling(
                             scaled_image, scaled_points, st.session_state.labelset, seg_params['scales'],
                             allow_overwrite=seg_params.get('allow_overwrite', False)
                         )
+                    else:  # Hybrid
+                        final_mask, _ = multi_scale_hybrid_labeling(
+                            scaled_image, scaled_points, st.session_state.labelset,
+                            seg_params['round_configs'],
+                            allow_overwrite=seg_params.get('allow_overwrite', False)
+                        )
+                    
+                    # Apply confidence filtering if enabled and threshold > 0
+                    if exp_conf_enabled and exp_conf_threshold > 0:
+                        confidence_map, _ = calculate_region_confidence(
+                            final_mask, scaled_points, st.session_state.labelset
+                        )
+                        final_mask = apply_confidence_threshold(final_mask, confidence_map, exp_conf_threshold)
                     
                     final_mask = cv2.resize(final_mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
                     

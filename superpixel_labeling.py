@@ -37,13 +37,18 @@ def join_masks(mask_old, mask_new):
     return np.where(mask_old == 0, mask_new, mask_old)
 
 
-def multi_scale_labeling(image, points_df, labelset, superpixel_counts):
-    """Apply multi-scale superpixel labeling."""
+def multi_scale_labeling(image, points_df, labelset, superpixel_counts, compactness=10, sigma=1, **kwargs):
+    """Apply multi-scale superpixel labeling.
+    
+    Args:
+        compactness: Higher = more regular/square superpixels, lower = follows edges more (1-50)
+        sigma: Smoothing before segmentation (0.1-3)
+    """
     combined_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
     intermediate_masks = []
     
     for n_superpixels in superpixel_counts:
-        superpixels = create_superpixels(n_superpixels, image)
+        superpixels = create_superpixels(n_superpixels, image, compactness=compactness, sigma=sigma)
         labeled_mask = label_superpixels_from_points(superpixels, points_df, labelset)
         combined_mask = join_masks(combined_mask, labeled_mask)
         intermediate_masks.append({

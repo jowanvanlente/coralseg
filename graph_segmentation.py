@@ -49,13 +49,19 @@ def label_segments_from_points(segments, points_df, labelset, return_confidence=
 
 
 def multi_scale_graph_labeling(image, points_df, labelset, scales=[100, 300, 1000],
-                               allow_overwrite=False, overwrite_threshold=2):
-    """Apply multi-scale graph-based segmentation."""
+                               allow_overwrite=False, overwrite_threshold=2,
+                               sigma=0.8, min_size=20):
+    """Apply multi-scale graph-based segmentation.
+    
+    Args:
+        sigma: Smoothing before segmentation (0.1-2), higher = smoother boundaries
+        min_size: Minimum segment size in pixels (10-200), smaller = more detail
+    """
     combined_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
     intermediate_masks = []
     
     for scale in scales:
-        segments = create_graph_segments(image, scale=scale, sigma=0.8, min_size=20)
+        segments = create_graph_segments(image, scale=scale, sigma=sigma, min_size=min_size)
         labeled_mask, confidence_map = label_segments_from_points(segments, points_df, labelset, return_confidence=True)
         
         if allow_overwrite:
