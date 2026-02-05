@@ -7,6 +7,33 @@ import pandas as pd
 import cv2
 import json
 import os
+import re
+
+
+def normalize_image_name(name):
+    """
+    Normalize image filename by removing duplicate extensions and copy suffixes.
+    Examples:
+        'image.jpeg.jpeg' -> 'image.jpeg'
+        'image.JPG.JPG' -> 'image.JPG'
+        'image (1).jpg' -> 'image.jpg'
+        'image_copy.jpg' -> 'image.jpg'
+    """
+    # Remove common copy suffixes like (1), (2), _copy, -copy
+    name = re.sub(r'\s*\(\d+\)\s*(?=\.)', '', name)
+    name = re.sub(r'[-_]?copy\d*(?=\.)', '', name, flags=re.IGNORECASE)
+    
+    # Handle duplicate extensions (e.g., .jpeg.jpeg, .JPG.JPG)
+    base, ext = os.path.splitext(name)
+    if ext:
+        # Check if base also ends with same extension (case-insensitive)
+        base_lower = base.lower()
+        ext_lower = ext.lower()
+        if base_lower.endswith(ext_lower):
+            # Remove the duplicate extension from base
+            name = base[:-len(ext)] + ext
+    
+    return name
 
 
 LABEL_META_BY_SHORT_CODE = {
@@ -122,7 +149,37 @@ def load_labelset_from_json(labelset_data):
 
 
 def load_annotations_from_df(df):
-    """Load sparse point annotations from DataFrame."""
+    """
+    Load sparse point annotations from DataFrame.
+    
+    Handles CSVs with extra columns - only uses Name, Row, Column, and Label.
+    Label column can be named 'Label', 'Label code', or 'label'.
+    """
+    df = df.copy()
+    
+    # Find the label column (could be 'Label', 'Label code', etc.)
+    label_col = None
+    for col in ['Label', 'Label code', 'label', 'label code']:
+        if col in df.columns:
+            label_col = col
+            break
+    
+    if label_col is None:
+        raise ValueError(f"CSV must have a label column (Label, Label code). Found: {list(df.columns)}")
+    
+    # Rename to standard 'Label' if needed
+    if label_col != 'Label':
+        df = df.rename(columns={label_col: 'Label'})
+    
+    # Check for required columns
+    required = ['Name', 'Row', 'Column', 'Label']
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV missing required columns: {missing}. Found: {list(df.columns)}")
+    
+    # Keep only required columns
+    df = df[required].copy()
+    
     return {name: group for name, group in df.groupby('Name')}
 
 

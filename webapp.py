@@ -16,7 +16,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from utils import load_labelset_from_json, load_annotations_from_df, scale_image_and_points
+from utils import load_labelset_from_json, load_annotations_from_df, scale_image_and_points, normalize_image_name
 from superpixel_labeling import multi_scale_labeling
 from adaptive_segmentation import multi_scale_adaptive_labeling
 from graph_segmentation import multi_scale_graph_labeling
@@ -134,14 +134,11 @@ uploaded_csv = st.sidebar.file_uploader(
 if uploaded_csv:
     try:
         df = pd.read_csv(uploaded_csv)
-        required_cols = {'Name', 'Row', 'Column', 'Label'}
-        if required_cols.issubset(df.columns):
-            st.session_state.points_dict = load_annotations_from_df(df)
-            total_points = sum(len(d) for d in st.session_state.points_dict.values())
-            st.sidebar.success(f"✓ {total_points:,} annotations loaded")
-        else:
-            missing = required_cols - set(df.columns)
-            st.sidebar.error(f"Missing columns: {missing}")
+        st.session_state.points_dict = load_annotations_from_df(df)
+        total_points = sum(len(d) for d in st.session_state.points_dict.values())
+        st.sidebar.success(f"✓ {total_points:,} annotations loaded")
+    except ValueError as e:
+        st.sidebar.error(str(e))
     except Exception as e:
         st.sidebar.error(f"Error reading CSV: {e}")
 
@@ -249,6 +246,100 @@ st.sidebar.info(f"Images: {len(st.session_state.images)}")
 st.sidebar.info(f"Annotated images: {len(st.session_state.points_dict)}")
 st.sidebar.info(f"Classes: {len(st.session_state.labelset)}")
 
+# Annotation Preview Button
+if st.session_state.points_dict or st.session_state.images:
+    if st.sidebar.button("🔍 Preview Annotations", use_container_width=True, 
+                         help="View annotation details and check image/annotation matching"):
+        st.session_state.show_annotation_preview = True
+
+# ==================== ANNOTATION PREVIEW ====================
+if 'show_annotation_preview' not in st.session_state:
+    st.session_state.show_annotation_preview = False
+
+if st.session_state.show_annotation_preview:
+    st.header("🔍 Annotation Preview & Matching Status")
+    
+    # Close button
+    if st.button("✖ Close Preview"):
+        st.session_state.show_annotation_preview = False
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # Build normalized matching
+    image_names = list(st.session_state.images.keys())
+    annotation_names = list(st.session_state.points_dict.keys())
+    
+    # Create normalized mappings
+    img_norm_map = {normalize_image_name(n): n for n in image_names}
+    ann_norm_map = {normalize_image_name(n): n for n in annotation_names}
+    
+    # Find matches via normalized names
+    matched_norm = set(img_norm_map.keys()) & set(ann_norm_map.keys())
+    matched_images = [img_norm_map[n] for n in matched_norm]
+    
+    images_without_annotations = [n for n in image_names if normalize_image_name(n) not in ann_norm_map]
+    annotations_without_images = [n for n in annotation_names if normalize_image_name(n) not in img_norm_map]
+    
+    # Matching statistics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Images", len(image_names))
+    with col2:
+        st.metric("Annotation Names", len(annotation_names))
+    with col3:
+        st.metric("✅ Matched", len(matched_images))
+    with col4:
+        total_annotations = sum(len(pts) for pts in st.session_state.points_dict.values())
+        st.metric("Total Points", total_annotations)
+    
+    st.markdown("---")
+    
+    # Simple search
+    search_query = st.text_input("🔎 Search (type to filter):", key="ann_search")
+    
+    # Tabs for different views
+    tab1, tab2, tab3 = st.tabs(["✅ Matched", "⚠️ Images without annotations", "❌ Annotations without images"])
+    
+    with tab1:
+        st.caption(f"{len(matched_images)} images matched via normalized names")
+        items = matched_images
+        if search_query:
+            items = [n for n in items if search_query.lower() in n.lower()]
+        for img_name in sorted(items)[:100]:
+            norm = normalize_image_name(img_name)
+            ann_name = ann_norm_map.get(norm, "")
+            ann_count = len(st.session_state.points_dict.get(ann_name, []))
+            if img_name == ann_name:
+                st.markdown(f"✅ `{img_name}` ({ann_count} pts)")
+            else:
+                st.markdown(f"✅ `{img_name}` ↔ `{ann_name}` ({ann_count} pts)")
+    
+    with tab2:
+        st.caption(f"{len(images_without_annotations)} images have no matching annotations")
+        items = images_without_annotations
+        if search_query:
+            items = [n for n in items if search_query.lower() in n.lower()]
+        for name in sorted(items)[:100]:
+            norm = normalize_image_name(name)
+            st.markdown(f"⚠️ `{name}` (normalized: `{norm}`)")
+    
+    with tab3:
+        st.caption(f"{len(annotations_without_images)} annotation entries have no matching image")
+        items = annotations_without_images
+        if search_query:
+            items = [n for n in items if search_query.lower() in n.lower()]
+        for name in sorted(items)[:100]:
+            norm = normalize_image_name(name)
+            ann_count = len(st.session_state.points_dict.get(name, []))
+            st.markdown(f"❌ `{name}` (normalized: `{norm}`) - {ann_count} pts")
+    
+    st.markdown("---")
+    st.info("💡 **Tip:** Normalized matching handles double extensions like `.JPG.JPG` → `.JPG`. If names still don't match, check capitalization and exact spelling.")
+    
+    st.stop()
+
 # ==================== MAIN CONTENT ====================
 if not st.session_state.images:
     st.info("👈 Upload images in the sidebar to get started.")
@@ -272,12 +363,29 @@ if not st.session_state.images:
     """)
     st.stop()
 
-# Get images with annotations
-annotated_images = [name for name in st.session_state.images.keys() 
-                   if name in st.session_state.points_dict]
+# Get images with annotations (using normalized name matching)
+# Build mapping: normalized_name -> original image name
+image_norm_map = {normalize_image_name(name): name for name in st.session_state.images.keys()}
+# Build mapping: normalized_name -> original annotation key
+ann_norm_map = {normalize_image_name(name): name for name in st.session_state.points_dict.keys()}
+
+# Find matches via normalized names
+annotated_images = []
+norm_to_image = {}  # normalized -> image name
+norm_to_ann = {}    # normalized -> annotation key
+for norm_name, img_name in image_norm_map.items():
+    if norm_name in ann_norm_map:
+        annotated_images.append(img_name)
+        norm_to_image[norm_name] = img_name
+        norm_to_ann[norm_name] = ann_norm_map[norm_name]
+
+# Store mappings in session state for use elsewhere
+st.session_state.norm_to_ann = norm_to_ann
+st.session_state.image_norm_map = image_norm_map
+st.session_state.ann_norm_map = ann_norm_map
 
 if not annotated_images:
-    st.warning("⚠️ No images have matching annotations. Make sure image filenames in your CSV match uploaded image names.")
+    st.warning("⚠️ No images have matching annotations. Make sure image filenames in your CSV match uploaded image names (check for double extensions like .JPG.JPG).")
     st.stop()
 
 # ==================== MODE SELECTION ====================
@@ -374,9 +482,13 @@ The number is a **similarity threshold** for merging regions:
         
         total_points_in_image = 0
         points_df = None
-        if test_image and test_image in st.session_state.points_dict:
-            points_df = st.session_state.points_dict[test_image]
-            total_points_in_image = len(points_df)
+        if test_image:
+            # Use normalized lookup to find annotations
+            norm_name = normalize_image_name(test_image)
+            ann_key = st.session_state.norm_to_ann.get(norm_name)
+            if ann_key:
+                points_df = st.session_state.points_dict[ann_key]
+                total_points_in_image = len(points_df)
         
         show_points = st.toggle("📍 Show annotations", value=False,
             help="Toggle to show/hide the sparse point annotations on the image")
@@ -580,12 +692,14 @@ The number is a **similarity threshold** for merging regions:
     
     # Process visualization
     if run_viz:
-        if test_image not in st.session_state.points_dict:
+        norm_name = normalize_image_name(test_image)
+        ann_key = st.session_state.norm_to_ann.get(norm_name)
+        if not ann_key:
             st.warning(f"No annotations for {test_image}")
         else:
             with st.spinner(f"Processing {test_image}..."):
                 image = st.session_state.images[test_image]
-                points_df = st.session_state.points_dict[test_image]
+                points_df = st.session_state.points_dict[ann_key]
                 
                 # Scale down
                 scaled_image, scaled_points = scale_image_and_points(image, points_df, scale_factor)
@@ -786,7 +900,10 @@ else:
                     status_text.text(f"Processing {image_name}...")
                     
                     image = st.session_state.images[image_name]
-                    points_df = st.session_state.points_dict[image_name]
+                    # Use normalized lookup for annotations
+                    norm_name = normalize_image_name(image_name)
+                    ann_key = st.session_state.norm_to_ann.get(norm_name, image_name)
+                    points_df = st.session_state.points_dict[ann_key]
                     
                     scaled_image, scaled_points = scale_image_and_points(image, points_df, scale_factor)
                     
