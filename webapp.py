@@ -21,10 +21,30 @@ from superpixel_labeling import multi_scale_labeling
 from adaptive_segmentation import multi_scale_adaptive_labeling
 from graph_segmentation import multi_scale_graph_labeling
 from hybrid_segmentation import multi_scale_hybrid_labeling
+from graph_first_segmentation import multi_scale_graph_first_labeling
 from coco_export import export_to_coco_dict
 from confidence_scoring import calculate_region_confidence, apply_confidence_threshold, get_confidence_summary
+from region_merging import merge_regions
 
 st.set_page_config(page_title="Annotation Segmentation", layout="wide")
+
+
+def count_segments(mask):
+    """Count distinct connected-component instances per class in a labeled mask.
+    Returns dict with 'total' and per-class breakdown."""
+    import cv2 as _cv2
+    stats = {}
+    total = 0
+    for cid in np.unique(mask):
+        if cid == 0:
+            continue
+        binary = (mask == cid).astype(np.uint8)
+        n_comp, _ = _cv2.connectedComponents(binary)
+        n_instances = n_comp - 1  # subtract background label
+        stats[int(cid)] = n_instances
+        total += n_instances
+    stats['total'] = total
+    return stats
 
 # Compact UI styling
 st.markdown("""
@@ -174,11 +194,11 @@ def compute_smart_graph_scales(processing_scale: float, num_rounds: int) -> list
 
 def get_smart_defaults(method: str, processing_scale: float, num_rounds: int) -> list:
     """Get smart default values for a given method, scale, and number of rounds."""
-    if method == "superpixel":
+    if method == "superpixel" or method == "graph_first_sp":
         return compute_smart_superpixel_scales(processing_scale, num_rounds)
     elif method == "adaptive":
         return compute_smart_adaptive_scales(processing_scale, num_rounds)
-    else:  # graph
+    else:  # graph, graph_first_gr
         return compute_smart_graph_scales(processing_scale, num_rounds)
 
 # ==================== SCALE-ADAPTIVE PARAMETER SYSTEM ====================
@@ -201,9 +221,9 @@ def scale_value(base_val, processing_scale, method):
     Graph: base_val / sqrt(scale) (threshold adjustment)
     Adaptive: no scaling (relative multipliers)
     """
-    if method == "superpixel":
+    if method in ("superpixel", "graph_first_sp"):
         return base_val * (processing_scale ** 2)
-    elif method == "graph":
+    elif method in ("graph", "graph_first_gr"):
         return base_val / (processing_scale ** 0.5)
     else:  # adaptive
         return base_val  # No scaling for adaptive (already relative)
@@ -213,18 +233,18 @@ def unscale_value(display_val, processing_scale, method):
     Convert display value back to base value (at 100% scale).
     Inverse of scale_value.
     """
-    if method == "superpixel":
+    if method in ("superpixel", "graph_first_sp"):
         return display_val / (processing_scale ** 2)
-    elif method == "graph":
+    elif method in ("graph", "graph_first_gr"):
         return display_val * (processing_scale ** 0.5)
     else:  # adaptive
         return display_val
 
 def get_base_defaults(method, num_rounds):
     """Get default BASE values (at 100% scale) for a method."""
-    if method == "superpixel":
+    if method in ("superpixel", "graph_first_sp"):
         return [5000, 1500, 500, 50][:num_rounds]
-    elif method == "graph":
+    elif method in ("graph", "graph_first_gr"):
         return [100, 300, 800, 2000][:num_rounds]
     else:  # adaptive
         if num_rounds == 1:
@@ -278,7 +298,7 @@ def update_base_from_display(prefix, method, round_idx, display_val, processing_
             base = display_val
         st.session_state[key][round_idx] = base
 
-def format_settings_txt(method, scale_factor, num_rounds, scale_values, seg_params, adapt_on, conf_threshold=0, conf_enabled=False):
+def format_settings_txt(method, scale_factor, num_rounds, scale_values, seg_params, adapt_on, conf_threshold=0, conf_enabled=False, merge_params=None):
     """Format current segmentation settings as a text string for export."""
     from datetime import datetime
     
@@ -302,8 +322,12 @@ def format_settings_txt(method, scale_factor, num_rounds, scale_values, seg_para
     lines.append("")
     lines.append("--- Advanced Settings ---")
     
-    if "hybrid" in method.lower():
-        lines.append("  (Default SLIC settings)")
+    if "graph-first" in method.lower():
+        lines.append(f"  Discovery Scale: {seg_params.get('discovery_scale', 1000)}")
+        lines.append(f"  Fill Method: {seg_params.get('fill_method', 'superpixel')}")
+        lines.append(f"  Allow Fill Overwrite: {seg_params.get('allow_overwrite', False)}")
+    elif "hybrid" in method.lower():
+        lines.append(f"  Allow Overwrite: {seg_params.get('allow_overwrite', False)}")
     elif "superpixel" in method.lower() or "slic" in method.lower():
         lines.append("  (Default SLIC settings)")
     elif "adaptive" in method.lower():
@@ -312,6 +336,17 @@ def format_settings_txt(method, scale_factor, num_rounds, scale_values, seg_para
         lines.append(f"  Allow Overwrite: {seg_params.get('allow_overwrite', False)}")
     elif "graph" in method.lower():
         lines.append(f"  Allow Overwrite: {seg_params.get('allow_overwrite', False)}")
+    
+    lines.append("")
+    lines.append("--- Region Merging ---")
+    if merge_params is not None:
+        lines.append("  Region Merging: ON")
+        lines.append(f"  Min Area (speckle removal): {merge_params.get('min_area', 100)}")
+        lines.append(f"  Small Region Merge: {merge_params.get('small_region_merge', 500)}")
+        lines.append(f"  Color Similarity Threshold: {merge_params.get('color_threshold', 30.0)}")
+        lines.append(f"  Morph Close Kernel: {merge_params.get('morph_close_ksize', 5)}")
+    else:
+        lines.append("  Region Merging: OFF (not applicable for this method)")
     
     lines.append("")
     lines.append("--- Confidence Filtering ---")
@@ -364,8 +399,11 @@ uploaded_images = st.sidebar.file_uploader(
     "Upload images",
     type=['jpg', 'jpeg', 'png'],
     accept_multiple_files=True,
-    help=("Upload the images you want to segment (.jpg, .jpeg, .png). "
-          "Tip: image filenames should match the CSV `Name` column (this app can also handle some filename quirks like .JPG.JPG).")
+    help=("Upload the images you want to create segmentation masks for (.jpg, .jpeg, .png). "
+          "You can select multiple files at once. Each image must have corresponding annotations in the CSV file. "
+          "Image filenames must match the 'Name' column in your CSV. "
+          "The app uses normalized matching to handle common quirks like double extensions (e.g. 'photo.JPG.JPG' matches 'photo.JPG'). "
+          "Larger images take longer to process -- the Processing Scale setting lets you trade speed for detail.")
 )
 
 if uploaded_images:
@@ -396,7 +434,10 @@ uploaded_csv = st.sidebar.file_uploader(
     "Upload annotations CSV",
     type=['csv'],
     help=("Upload the CoralNet (or similar) CSV with one annotation point per row. "
-          "Required columns are: Name, Row, Column, and a label column (e.g. Label or Label code). "
+          "Required columns: 'Name' (image filename), 'Row' (Y pixel coordinate), 'Column' (X pixel coordinate), "
+          "and a label column (e.g. 'Label' or 'Label code') matching your labelset Short Codes. "
+          "Each row represents one point annotation on one image. The segmentation algorithm uses these sparse points "
+          "as seeds to grow full dense masks. More points per image generally means better segmentation quality. "
           "Extra columns are OK and will be ignored.")
 )
 
@@ -698,14 +739,19 @@ all_images = list(st.session_state.images.keys())
 col_match1, col_match2, col_match3 = st.columns([1, 1, 2])
 
 with col_match1:
-    if st.button("(Re)load images and annotations", help="Re-run matching between uploaded images and CSV `Name` entries"):
+    if st.button("(Re)load images and annotations", help="Re-runs the matching between your uploaded image filenames and the 'Name' column in your CSV. "
+            "This is necessary after uploading new images or a new CSV, because the app needs to figure out which CSV rows belong to which image. "
+            "The matching uses normalized filenames (e.g. 'photo.JPG.JPG' becomes 'photo.JPG') so minor naming inconsistencies are handled automatically. "
+            "After clicking, check the match summary to make sure all your images have annotations."):
         annotated_images = rebuild_matching()
         st.toast(f"✅ Matching updated: {len(annotated_images)} of {len(all_images)} images have annotations")
         st.rerun()
 
 with col_match2:
     show_all_images = st.checkbox("Show all images", value=False, 
-                                   help="If enabled, you can select images even if they have no matching annotations")
+                                   help="By default, only images that have matching annotations in your CSV are shown in the dropdown. "
+                                        "Enable this to also see images that have no CSV match -- useful for debugging filename mismatches. "
+                                        "You cannot segment an image without annotations, so unmatched images will show a warning if selected.")
 
 with col_match3:
     st.caption(f"📊 **{len(annotated_images)}** matched / **{len(all_images)}** total images loaded")
@@ -754,7 +800,7 @@ if mode == "🔬 Test Segmentation":
         st.markdown("**Segmentation Method**")
         seg_method = st.radio(
             "Method",
-            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)"],
+            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)", "🔍 Graph-First (Anchor + Fill)"],
             horizontal=False,
             label_visibility="collapsed"
         )
@@ -825,7 +871,7 @@ The number is a **similarity threshold** for merging regions:
 
 **Can overwrite:** If enabled and a coarser scale has high confidence, it can correct over-segmentation.""")
             
-            else:  # Hybrid
+            elif seg_method == "🔀 Hybrid (SLIC + Graph)":
                 with st.expander("ℹ️ How Hybrid works", expanded=False):
                     st.markdown("""**Hybrid Segmentation (SLIC + Felzenszwalb combined)**
 
@@ -841,10 +887,34 @@ The number is a **similarity threshold** for merging regions:
 - **G rounds:** Number = merge threshold (higher = larger regions)
 
 **Example:** S:3000 → G:500 → S:100 = Start precise with SLIC, fill gaps with Graph, then coarse SLIC pass.""")
+            
+            else:  # Graph-First
+                with st.expander("ℹ️ How Graph-First works", expanded=False):
+                    st.markdown("""**Graph-First (Anchor + Fill) Segmentation**
+
+**Basic idea:** First, run Felzenszwalb at a **high** scale to discover the obvious, coherent objects (corals, rocks, etc.). These large regions become "anchor" labels. Then, fill in the remaining unlabeled areas with progressive multi-round segmentation.
+
+**Why this works:**
+- A high Felzenszwalb scale merges similar pixels aggressively → only genuinely distinct objects survive as separate regions.
+- These discovery regions are high-confidence because they represent structures the algorithm is *sure* about.
+- The fill-in rounds (Superpixel or Graph) then handle the less certain surrounding areas progressively.
+
+**Two phases:**
+1. **Discovery (Graph, high scale):** e.g. scale 1000-2000. Creates a few large regions following natural boundaries. Labels these from your points → anchors.
+2. **Fill-in (1-4 rounds):** Uses Superpixel counts or Graph scales to progressively fill remaining unlabeled pixels. Anchor labels are never overwritten (by default).
+
+**When to use it:**
+- When you have distinct objects (corals) surrounded by more ambiguous background.
+- When you want the algorithm to "see" the important structures first, then fill in around them.
+- Works especially well for images where obvious color/texture boundaries define the key objects.""")
         
         with col_scale_inner:
             scale_factor = st.slider("Processing Scale", 0.1, 1.0, st.session_state.custom_defaults['scale_factor'], 0.05,
-                help="Lower = faster but less detail. 0.4 recommended for good balance.")
+                help="Controls the resolution at which segmentation is computed. "
+                     "The image is resized to this fraction before processing (e.g. 0.4 = 40%% of original pixels). "
+                     "Lower values are much faster because the algorithm works on fewer pixels, but fine details and small objects may be lost. "
+                     "Higher values preserve detail but take significantly longer. "
+                     "Recommended: 0.3-0.5 for most images. Use 0.2 for very large images or quick tests, 0.6+ when you need precise boundaries on small objects.")
             st.caption(f"Processing at {scale_factor*100:.0f}% → ~{1/(scale_factor**2):.0f}x faster")
             if st.button("💾 Save", key="save_scale", help="Save this value as your default"):
                 st.session_state.custom_defaults['scale_factor'] = scale_factor
@@ -871,7 +941,10 @@ The number is a **similarity threshold** for merging regions:
                 total_points_in_image = len(points_df)
         
         show_points = st.toggle("📍 Show annotations", value=False,
-            help="Toggle to show/hide the sparse point annotations on the image")
+            help="Overlay the original sparse point annotations on the preview image. "
+                 "Each dot is one annotation from your CSV, colored by its class label. "
+                 "Use this to verify that annotation points actually land on the correct objects before running segmentation. "
+                 "If points appear in wrong locations, check that your CSV Row/Column values match this image.")
         
         if test_image:
             image = st.session_state.images[test_image]
@@ -933,11 +1006,17 @@ The number is a **similarity threshold** for merging regions:
         
         # Number of rounds selector
         num_rounds = st.slider("Rounds", 1, 4, st.session_state.custom_defaults['num_rounds'], 1,
-            help="More rounds = better coverage but slower")
+            help="How many segmentation passes to run on the image. Each round creates segments at a different scale and labels unlabeled pixels. "
+                 "Round 1 typically covers the majority of the image. Rounds 2-4 progressively fill in remaining gaps with coarser/finer segments. "
+                 "More rounds = better pixel coverage (closer to 100%%) but slower processing. "
+                 "3 rounds is a good default. Use 1-2 for quick tests, 4 if you see gaps in the final mask.")
         
         # Adapt values toggle
         use_smart = st.toggle("Adapt values", value=True, key="test_smart",
-            help="Auto-adjust for processing scale")
+            help="When ON, the round parameter values are automatically adjusted based on your Processing Scale. "
+                 "For example, at 40%% scale the image has only 16%% of its original pixels, so superpixel counts are reduced proportionally "
+                 "to keep region sizes visually similar. Without this, the same superpixel count on a smaller image would create tiny, useless regions. "
+                 "When OFF, you control the exact raw values. Leave this ON unless you know exactly what values you need.")
         
         # Get method key
         if seg_method == "🔷 Superpixel (SLIC)":
@@ -949,9 +1028,12 @@ The number is a **similarity threshold** for merging regions:
         elif seg_method == "📊 Graph-based (Felzenszwalb)":
             method_key = "graph"
             options = LOG_OPTIONS_5K
-        else:  # Hybrid
+        elif seg_method == "🔀 Hybrid (SLIC + Graph)":
             method_key = "hybrid"
             options = LOG_OPTIONS_10K  # Will be dynamic per round
+        else:  # Graph-First
+            method_key = "graph_first"
+            options = LOG_OPTIONS_5K  # Discovery scale uses graph options
         
         # Initialize base values (persistent, at 100% scale)
         base_values = init_base_values("test", method_key, num_rounds)
@@ -964,7 +1046,7 @@ The number is a **similarity threshold** for merging regions:
         if test_scale_track not in st.session_state:
             st.session_state[test_scale_track] = scale_factor
         
-        if use_smart and st.session_state[test_scale_track] != scale_factor and method_key != "hybrid":
+        if use_smart and st.session_state[test_scale_track] != scale_factor and method_key not in ("hybrid", "graph_first"):
             st.session_state[test_scale_track] = scale_factor
             # Pre-set widget keys to new display values (before widgets are created)
             prefixes = {"superpixel": "test_sp_", "adaptive": "test_ad_", "graph": "test_gr_"}
@@ -1017,9 +1099,24 @@ The number is a **similarity threshold** for merging regions:
                 scale_values.append(val)
             
             with st.expander("⚙️ Advanced", expanded=False):
-                min_dist = st.slider("Min dist", 1, 50, st.session_state.custom_defaults['adaptive_min_dist'], 1)
-                density_thresh = st.slider("Density", 1, 20, st.session_state.custom_defaults['adaptive_density'], 1)
-                allow_ow = st.checkbox("Overwrite", value=False, key="ad_ow")
+                min_dist = st.slider("Min dist", 1, 50, st.session_state.custom_defaults['adaptive_min_dist'], 1,
+                    help="Minimum distance (in pixels) between watershed seed points. "
+                         "The adaptive method places seeds at your annotation points and grows regions outward. "
+                         "This setting prevents seeds that are very close together from creating redundant tiny regions. "
+                         "Higher values = fewer seeds = larger, simpler regions. Lower values = more seeds = finer detail but potentially noisy boundaries. "
+                         "Default 10 works well for most cases.")
+                density_thresh = st.slider("Density", 1, 20, st.session_state.custom_defaults['adaptive_density'], 1,
+                    help="Controls how many annotation points must be nearby for a region to be considered 'densely annotated'. "
+                         "In areas with fewer points than this threshold, the algorithm uses larger, coarser regions to fill gaps. "
+                         "In areas above this threshold, it creates finer regions. "
+                         "Higher values = more of the image is treated as 'sparse' and gets coarser regions. "
+                         "Lower values = the algorithm treats most areas as dense and creates finer segments everywhere. "
+                         "Default 5 is usually good.")
+                allow_ow = st.checkbox("Overwrite", value=False, key="ad_ow",
+                    help="When OFF (default), once a pixel is labeled in an earlier round, it stays labeled -- later rounds only fill gaps. "
+                         "When ON, a later round can overwrite an earlier label if the new round has higher confidence for that pixel. "
+                         "This can improve accuracy in areas where the first round made a poor assignment, but may also cause instability. "
+                         "Recommendation: leave OFF for your first attempt, try ON if you see obvious mislabeling.")
             
             seg_params = {
                 'scales': scale_values,
@@ -1048,14 +1145,18 @@ The number is a **similarity threshold** for merging regions:
                 scale_values.append(val)
             
             with st.expander("⚙️ Advanced", expanded=False):
-                g_allow_ow = st.checkbox("Overwrite", value=False, key="gr_ow")
+                g_allow_ow = st.checkbox("Overwrite", value=False, key="gr_ow",
+                    help="When OFF (default), once a pixel is labeled in an earlier round, it stays labeled -- later rounds only fill gaps. "
+                         "When ON, a later round can overwrite an earlier label if the new round has higher confidence for that pixel. "
+                         "This can improve accuracy in areas where the first round made a poor assignment, but may also cause instability. "
+                         "Recommendation: leave OFF for your first attempt, try ON if you see obvious mislabeling.")
             
             seg_params = {
                 'scales': scale_values,
                 'allow_overwrite': g_allow_ow
             }
         
-        else:  # Hybrid
+        elif seg_method == "🔀 Hybrid (SLIC + Graph)":
             st.caption("**S** = Superpixel (count), **G** = Graph (threshold)")
             round_configs = []
             
@@ -1109,22 +1210,147 @@ The number is a **similarity threshold** for merging regions:
                 })
             
             with st.expander("⚙️ Advanced", expanded=False):
-                h_allow_ow = st.checkbox("Overwrite", value=False, key="hybrid_ow")
+                h_allow_ow = st.checkbox("Overwrite", value=False, key="hybrid_ow",
+                    help="When OFF (default), once a pixel is labeled in an earlier round, it stays labeled -- later rounds only fill gaps. "
+                         "When ON, a later round can overwrite an earlier label if the new round has higher confidence for that pixel. "
+                         "This can improve accuracy in areas where the first round made a poor assignment, but may also cause instability. "
+                         "Recommendation: leave OFF for your first attempt, try ON if you see obvious mislabeling.")
             
             seg_params = {
                 'round_configs': round_configs,
                 'allow_overwrite': h_allow_ow
             }
         
+        else:  # Graph-First (Anchor + Fill)
+            st.markdown("**Phase 1: Discovery**")
+            gf_discovery_scale = st.select_slider(
+                "Discovery scale",
+                options=LOG_OPTIONS_5K,
+                value=1000,
+                key="test_gf_discovery",
+                help="Felzenszwalb scale for the discovery phase. Higher values create fewer, larger regions that represent "
+                     "the most obvious objects in the image. At scale 1000-2000 only genuinely distinct structures (corals, rocks) "
+                     "survive as separate regions. These become your 'anchor' labels that fill-in rounds respect. "
+                     "Try 500 for more detailed discovery, 2000+ for only the most prominent objects."
+            )
+            
+            st.markdown("**Phase 2: Fill-in**")
+            gf_fill_method = st.radio(
+                "Fill method",
+                ["Superpixel", "Graph"],
+                horizontal=True,
+                key="test_gf_fill_method",
+                help="Which algorithm to use for the fill-in rounds. "
+                     "Superpixel (SLIC) creates compact, boundary-respecting regions -- good for clean edges. "
+                     "Graph (Felzenszwalb) follows texture/color similarity -- good for natural boundaries."
+            )
+            gf_fill_key = "graph_first_sp" if gf_fill_method == "Superpixel" else "graph_first_gr"
+            gf_fill_options = LOG_OPTIONS_10K if gf_fill_method == "Superpixel" else LOG_OPTIONS_5K
+            
+            # Initialize fill-round base values
+            gf_fill_base = init_base_values("test", gf_fill_key, num_rounds)
+            gf_fill_display = get_display_values(gf_fill_base, scale_factor, gf_fill_key, use_smart, gf_fill_options)
+            
+            gf_fill_values = []
+            for i in range(num_rounds):
+                def make_gf_callback(idx, mkey, pscale, adapt):
+                    def cb():
+                        widget_key = f"test_gf_fill_{idx}"
+                        if widget_key in st.session_state:
+                            update_base_from_display("test", mkey, idx, st.session_state[widget_key], pscale, adapt)
+                    return cb
+                
+                val = st.select_slider(
+                    f"Fill {i+1}",
+                    options=gf_fill_options,
+                    value=gf_fill_display[i],
+                    key=f"test_gf_fill_{i}",
+                    on_change=make_gf_callback(i, gf_fill_key, scale_factor, use_smart)
+                )
+                gf_fill_values.append(val)
+            
+            with st.expander("⚙️ Advanced", expanded=False):
+                gf_allow_ow = st.checkbox("Allow fill to overwrite anchors", value=False, key="test_gf_ow",
+                    help="When OFF (default), fill-in rounds can only label pixels that the discovery round left unlabeled. "
+                         "The discovery 'anchor' labels are preserved. This is usually what you want -- the discovery round identifies "
+                         "the obvious objects, and fill-in just handles the rest. "
+                         "When ON, fill-in rounds can overwrite discovery labels. Only use this if discovery is mislabeling some areas.")
+            
+            seg_params = {
+                'discovery_scale': gf_discovery_scale,
+                'fill_method': 'superpixel' if gf_fill_method == 'Superpixel' else 'graph',
+                'fill_values': gf_fill_values,
+                'allow_overwrite': gf_allow_ow
+            }
+        
+        # Region merging (graph/hybrid/graph_first only)
+        merge_params = None
+        if method_key in ("graph", "hybrid", "graph_first"):
+            merge_enabled = st.checkbox(
+                "Enable region merging", value=True, key="test_merge_enabled",
+                help="Felzenszwalb graph segmentation often produces hundreds or thousands of tiny fragments per object instead of one clean region. "
+                     "Region merging is a postprocessing step that consolidates those fragments into coherent, object-level masks. "
+                     "This is strongly recommended when exporting to Roboflow, because without merging each tiny fragment becomes a separate annotation, "
+                     "which is unusable for training. With merging enabled, you typically go from thousands of segments down to tens."
+            )
+            if merge_enabled:
+                with st.expander("🔗 Merge settings", expanded=False):
+                    merge_min_area = st.slider("Min area (speckle removal)", 10, 2000, 100, 10,
+                        key="test_merge_min_area",
+                        help="Any isolated region (connected group of same-class pixels) smaller than this many pixels is removed entirely and set to background. "
+                             "This cleans up tiny specks and noise that Felzenszwalb leaves behind -- single pixels, small dots, sensor noise artifacts. "
+                             "These specks would each become a tiny, useless annotation in Roboflow. "
+                             "Higher values remove more aggressively (but may delete legitimately small objects). "
+                             "At 20%% processing scale, 100 pixels here corresponds to roughly 2500 pixels in the original image. "
+                             "Default 100 is conservative. Increase to 300-500 if you still see many tiny speckles.")
+                    merge_small = st.slider("Small region merge", 50, 5000, 500, 50,
+                        key="test_merge_small",
+                        help="After speckle removal, regions of the same class that are still smaller than this pixel count get merged into their nearest same-class neighbor. "
+                             "For example, if 'coral' has a large region and a small fragment 20px away, the small fragment gets spatially connected to the large one via a thin bridge. "
+                             "This dramatically reduces the number of separate instances per class, turning many scattered fragments into a few coherent objects. "
+                             "Higher values = more aggressive merging (larger fragments get absorbed). "
+                             "Default 500 works well. Increase to 1000-2000 if you want fewer, larger objects. Decrease if small separate objects are important.")
+                    merge_color = st.slider("Color similarity threshold", 0.0, 100.0, 30.0, 5.0,
+                        key="test_merge_color",
+                        help="After size-based merging, this step looks at adjacent regions of the same class and merges them if their average colors are similar enough. "
+                             "The value is the maximum Euclidean distance in RGB color space (0-255 per channel) between two regions' mean colors for them to be merged. "
+                             "For example, two 'sand' regions that are both beige (similar RGB) will be merged into one, but a light sand and dark shadow region won't be. "
+                             "Higher values = merge more aggressively (even regions with somewhat different colors). "
+                             "Set to 0 to disable color-based merging entirely. "
+                             "Default 30 merges visually similar regions. Increase to 50-80 for more merging, or decrease to 10-15 to only merge near-identical colors.")
+                    merge_morph = st.slider("Morph close kernel", 0, 51, 5, 1,
+                        key="test_merge_morph",
+                        help="Morphological closing is an image processing operation that fills small holes and gaps inside regions. "
+                             "Imagine each class mask as a shape with tiny pin-holes and ragged edges -- closing smooths those out by expanding the shape slightly, then shrinking it back. "
+                             "The kernel size controls how large the 'fill brush' is (in pixels on the processed image): larger values fill bigger gaps but may also merge regions that should stay separate. "
+                             "IMPORTANT: this value is in processed-image pixels, so it depends on your Processing Scale. "
+                             "At 20%% scale, kernel 5 covers ~25 original pixels. At 100%% scale, kernel 5 only covers 5 original pixels -- "
+                             "so at high scales you may need kernel 15-30+ to get the same physical gap-filling effect. "
+                             "This runs BEFORE speckle removal and size-based merging. Set to 0 to skip. Default 5 is good at low scales (0.2-0.4). "
+                             "At higher scales (0.6+), try 11-25. Values above 30 are aggressive and may over-smooth boundaries.")
+                merge_params = {
+                    'min_area': merge_min_area,
+                    'small_region_merge': merge_small,
+                    'color_threshold': merge_color,
+                    'morph_close_ksize': merge_morph
+                }
+        
         # Confidence filtering (optional)
         conf_enabled = st.checkbox(
             "Enable confidence filtering (slower)", value=False, key="conf_enabled",
-            help="Adds extra processing time but lets you filter uncertain segments in the result."
+            help="Calculates a confidence score (0-100) for each labeled region based on how well it matches the nearby annotation points. "
+                 "Regions far from any annotation point, or where the label disagrees with nearby points, get low confidence. "
+                 "This adds noticeable processing time because it must analyze every region's relationship to every annotation point. "
+                 "Use this when you want to remove uncertain or likely-incorrect labels from your output before sending to Roboflow."
         )
         if conf_enabled:
             conf_threshold = st.slider(
                 "Confidence threshold", 0, 100, 40, 5, key="conf_threshold",
-                help="Hide regions with confidence below this value"
+                help="Regions with a confidence score below this value are removed (set to background). "
+                     "A score of 0 means 'no confidence at all' and 100 means 'perfectly certain'. "
+                     "Higher threshold = stricter filtering = more regions removed = less coverage but higher quality labels. "
+                     "Lower threshold = keeps more regions including uncertain ones = better coverage but some labels may be wrong. "
+                     "Default 40 is a moderate filter. Try 20 for lenient, 60-80 for strict."
             )
         else:
             conf_threshold = 0
@@ -1136,9 +1362,12 @@ The number is a **similarity threshold** for merging regions:
         if seg_method == "🔀 Hybrid (SLIC + Graph)":
             # For hybrid, format round_configs as scale_values for export
             hybrid_scale_values = [f"{c['type'][0].upper()}:{c['value']}" for c in round_configs]
-            settings_txt = format_settings_txt(seg_method, scale_factor, num_rounds, hybrid_scale_values, seg_params, use_smart, conf_threshold, conf_enabled)
+            settings_txt = format_settings_txt(seg_method, scale_factor, num_rounds, hybrid_scale_values, seg_params, use_smart, conf_threshold, conf_enabled, merge_params)
+        elif seg_method == "🔍 Graph-First (Anchor + Fill)":
+            gf_display_values = [f"D:{seg_params['discovery_scale']}"] + [f"F:{v}" for v in seg_params['fill_values']]
+            settings_txt = format_settings_txt(seg_method, scale_factor, num_rounds, gf_display_values, seg_params, use_smart, conf_threshold, conf_enabled, merge_params)
         else:
-            settings_txt = format_settings_txt(seg_method, scale_factor, num_rounds, scale_values, seg_params, use_smart, conf_threshold, conf_enabled)
+            settings_txt = format_settings_txt(seg_method, scale_factor, num_rounds, scale_values, seg_params, use_smart, conf_threshold, conf_enabled, merge_params)
         st.download_button(
             "💾 Export Settings",
             settings_txt,
@@ -1195,7 +1424,11 @@ The number is a **similarity threshold** for merging regions:
                     colored_mask[filtered_mask == class_id] = color_code
             
             # Opacity slider
-            mask_opacity = st.slider("Overlay strength", 0, 100, 60, 5)
+            mask_opacity = st.slider("Overlay strength", 0, 100, 60, 5,
+                help="Controls how transparent the colored segmentation mask is on top of the original image. "
+                     "0%% = you only see the original photo (no mask visible). 100%% = you only see the colored mask (no photo visible). "
+                     "60%% is a good default for inspecting results -- you can see both the class colors and the underlying image. "
+                     "Lower it to 20-30%% if you want to focus on the photo, raise it to 80-100%% to focus purely on which pixels got which label.")
             mask_alpha = mask_opacity / 100.0
             
             # Compute overlay
@@ -1254,6 +1487,44 @@ The number is a **similarity threshold** for merging regions:
                                 f"</div></div>",
                                 unsafe_allow_html=True
                             )
+            # --- Segment count panel ---
+            with st.expander("📊 Segment Counts (for Roboflow)", expanded=True):
+                pre_stats = result.get('pre_merge_seg_stats', {})
+                post_stats = result.get('post_merge_seg_stats', {})
+                merge_applied = result.get('merge_applied', False)
+                
+                if merge_applied and pre_stats.get('total', 0) > 0:
+                    st.markdown(
+                        f"**Before merge:** {pre_stats.get('total', '?')} segments &rarr; "
+                        f"**After merge:** {post_stats.get('total', '?')} segments "
+                        f"(**{pre_stats.get('total',0) - post_stats.get('total',0)}** removed)"
+                    )
+                else:
+                    st.markdown(f"**Total segments:** {post_stats.get('total', '?')}")
+                
+                # Per-class breakdown table
+                seg_rows = []
+                for entry in st.session_state.labelset:
+                    cid = int(entry.get('Count', 0))
+                    post_n = post_stats.get(cid, 0)
+                    if post_n <= 0:
+                        continue
+                    row = {
+                        'Class': entry.get('Name', entry.get('Short Code', '')),
+                        'Segments': post_n,
+                    }
+                    if merge_applied:
+                        pre_n = pre_stats.get(cid, 0)
+                        row['Before Merge'] = pre_n
+                        row['Reduced'] = pre_n - post_n
+                    seg_rows.append(row)
+                
+                if seg_rows:
+                    seg_rows.sort(key=lambda x: x['Segments'], reverse=True)
+                    import pandas as _pd
+                    st.dataframe(_pd.DataFrame(seg_rows), use_container_width=True, hide_index=True)
+                
+                st.caption("Each 'segment' is a separate connected-component instance that Roboflow will see as an individual annotation.")
         else:
             st.info("👈 Click 'Visualize' to see result")
     
@@ -1288,12 +1559,29 @@ The number is a **similarity threshold** for merging regions:
                         scaled_image, scaled_points, st.session_state.labelset, seg_params['scales'],
                         allow_overwrite=seg_params.get('allow_overwrite', False)
                     )
-                else:  # Hybrid
+                elif seg_method == "🔀 Hybrid (SLIC + Graph)":
                     final_mask, intermediate = multi_scale_hybrid_labeling(
                         scaled_image, scaled_points, st.session_state.labelset,
                         seg_params['round_configs'],
                         allow_overwrite=seg_params.get('allow_overwrite', False)
                     )
+                else:  # Graph-First
+                    final_mask, intermediate = multi_scale_graph_first_labeling(
+                        scaled_image, scaled_points, st.session_state.labelset,
+                        discovery_scale=seg_params['discovery_scale'],
+                        fill_method=seg_params['fill_method'],
+                        fill_values=seg_params['fill_values'],
+                        allow_overwrite=seg_params.get('allow_overwrite', False)
+                    )
+                
+                # Apply region merging for graph/hybrid methods
+                pre_merge_seg_stats = count_segments(final_mask)
+                if merge_params is not None:
+                    final_mask = merge_regions(
+                        final_mask, image=scaled_image,
+                        **merge_params
+                    )
+                post_merge_seg_stats = count_segments(final_mask)
                 
                 # Calculate confidence scores only if enabled
                 if conf_enabled:
@@ -1327,7 +1615,10 @@ The number is a **similarity threshold** for merging regions:
                     'scaled_points': scaled_points,
                     'intermediate': intermediate,
                     'scaled_image': scaled_image,
-                    'coverage': coverage
+                    'coverage': coverage,
+                    'pre_merge_seg_stats': pre_merge_seg_stats,
+                    'post_merge_seg_stats': post_merge_seg_stats,
+                    'merge_applied': merge_params is not None
                 }
                 
                 st.success(f"✓ Processed {test_image}")
@@ -1467,17 +1758,19 @@ else:
         st.markdown("**Segmentation Method**")
         seg_method = st.radio(
             "Method",
-            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)"],
+            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)", "🔍 Graph-First (Anchor + Fill)"],
             key="export_method", label_visibility="collapsed"
         )
         if seg_method == "🔷 Superpixel (SLIC)":
-            st.caption("Superpixels: split into regions first, then spread point labels to whole regions. Usually a good default.")
+            st.caption("Superpixels: divides the image into compact, boundary-respecting regions (SLIC algorithm), then assigns each region the label of the nearest annotation point inside it. Best all-round default when objects have clear visual edges.")
         elif seg_method == "🎯 Adaptive (Density-based)":
-            st.caption("Adaptive: grows regions from points to fill gaps; can be better when points are sparse/uneven.")
+            st.caption("Adaptive: grows regions outward from each annotation point like a watershed, filling gaps proportionally. Works well when annotation density varies across the image or when Superpixels leave uncolored gaps.")
         elif seg_method == "📊 Graph-based (Felzenszwalb)":
-            st.caption("Graph-based: merges pixels by similarity; can follow natural texture/color boundaries.")
+            st.caption("Graph-based: uses Felzenszwalb's algorithm to merge pixels by color/texture similarity into regions, then labels each region from your points. Follows natural boundaries well but produces many small fragments -- use Region Merging (below) to consolidate.")
+        elif seg_method == "🔀 Hybrid (SLIC + Graph)":
+            st.caption("Hybrid: lets you choose Superpixel (S) or Graph (G) independently for each round. Useful when you want SLIC's clean regions for an initial pass and Graph's texture-following for gap-filling, or vice versa.")
         else:
-            st.caption("Hybrid: mix SLIC and Graph methods per round for maximum control.")
+            st.caption("Graph-First: discovers the obvious coherent objects with a high-scale Felzenszwalb pass first, then fills remaining areas with progressive rounds. Anchored discovery labels are preserved during fill-in.")
         
         with st.expander("ℹ️ Method details (what it does / when to use)", expanded=False):
             if seg_method == "🔷 Superpixel (SLIC)":
@@ -1506,7 +1799,7 @@ else:
                     - **When to use:** when you want segments that follow texture/color patterns rather than a fixed grid.
                     """
                 )
-            else:
+            elif seg_method == "🔀 Hybrid (SLIC + Graph)":
                 st.markdown(
                     """**Hybrid (SLIC + Graph combined)**
 
@@ -1516,14 +1809,36 @@ else:
                     - **When to use:** when you want to combine the strengths of both methods.
                     """
                 )
+            else:
+                st.markdown(
+                    """**Graph-First (Anchor + Fill)**
+
+                    - **What it does:** runs Felzenszwalb at a high scale first to discover the obvious coherent objects, then fills remaining areas with progressive rounds.
+                    - **Discovery phase:** high scale → large regions → only the most prominent structures survive → anchor labels.
+                    - **Fill-in phase:** Superpixel or Graph rounds progressively fill unlabeled areas without overwriting anchors.
+                    - **When to use:** when distinct objects (corals, rocks) are surrounded by ambiguous background and you want the algorithm to identify the important structures first.
+                    """
+                )
     
     with col_params:
         st.markdown("**Parameters**")
         exp_scale_factor = st.slider("Scale", 0.1, 1.0, st.session_state.custom_defaults['scale_factor'], 0.1,
-            key="export_scale", help="Lower = faster but less detail")
+            key="export_scale", help="Controls the resolution at which segmentation is computed. "
+                 "The image is resized to this fraction before processing (e.g. 0.4 = 40%% of original pixels). "
+                 "Lower values are much faster because the algorithm works on fewer pixels, but fine details and small objects may be lost. "
+                 "Higher values preserve detail but take significantly longer -- this matters a lot when batch-processing many images. "
+                 "Recommended: 0.3-0.5 for most images. Use 0.2 for very large images or quick tests, 0.6+ when you need precise boundaries on small objects.")
         
-        exp_num_rounds = st.slider("Rounds", 1, 4, st.session_state.custom_defaults['num_rounds'], 1, key="exp_rounds")
-        exp_use_smart = st.toggle("Adapt values", value=True, key="exp_smart", help="Auto-adjust for scale")
+        exp_num_rounds = st.slider("Rounds", 1, 4, st.session_state.custom_defaults['num_rounds'], 1, key="exp_rounds",
+            help="How many segmentation passes to run per image. Each round creates segments at a different scale and labels unlabeled pixels. "
+                 "Round 1 typically covers the majority of the image. Rounds 2-4 progressively fill in remaining gaps with coarser/finer segments. "
+                 "More rounds = better pixel coverage (closer to 100%%) but slower processing. "
+                 "3 rounds is a good default. Use 1-2 for quick tests, 4 if you see gaps in the final mask.")
+        exp_use_smart = st.toggle("Adapt values", value=True, key="exp_smart",
+            help="When ON, the round parameter values are automatically adjusted based on your Processing Scale. "
+                 "For example, at 40%% scale the image has only 16%% of its original pixels, so superpixel counts are reduced proportionally "
+                 "to keep region sizes visually similar. Without this, the same superpixel count on a smaller image would create tiny, useless regions. "
+                 "When OFF, you control the exact raw values. Leave this ON unless you know exactly what values you need.")
         
         # Get method key
         if seg_method == "🔷 Superpixel (SLIC)":
@@ -1535,9 +1850,12 @@ else:
         elif seg_method == "📊 Graph-based (Felzenszwalb)":
             exp_method_key = "graph"
             exp_options = LOG_OPTIONS_5K
-        else:  # Hybrid
+        elif seg_method == "🔀 Hybrid (SLIC + Graph)":
             exp_method_key = "hybrid"
             exp_options = LOG_OPTIONS_10K
+        else:  # Graph-First
+            exp_method_key = "graph_first"
+            exp_options = LOG_OPTIONS_5K
         
         # Initialize base values (persistent, at 100% scale)
         exp_base_values = init_base_values("exp", exp_method_key, exp_num_rounds)
@@ -1550,7 +1868,7 @@ else:
         if exp_scale_track not in st.session_state:
             st.session_state[exp_scale_track] = exp_scale_factor
         
-        if exp_use_smart and st.session_state[exp_scale_track] != exp_scale_factor and exp_method_key != "hybrid":
+        if exp_use_smart and st.session_state[exp_scale_track] != exp_scale_factor and exp_method_key not in ("hybrid", "graph_first"):
             st.session_state[exp_scale_track] = exp_scale_factor
             # Pre-set widget keys to new display values (before widgets are created)
             prefixes = {"superpixel": "exp_sp_", "adaptive": "exp_ad_", "graph": "exp_gr_"}
@@ -1600,9 +1918,12 @@ else:
                 )
                 exp_scale_values.append(val)
             with st.expander("⚙️ Advanced", expanded=False):
-                exp_min_dist = st.slider("Min dist", 1, 50, st.session_state.custom_defaults['adaptive_min_dist'], 1, key="exp_min_dist")
-                exp_density = st.slider("Density", 1, 20, st.session_state.custom_defaults['adaptive_density'], 1, key="exp_density")
-                exp_allow_ow = st.checkbox("Overwrite", value=False, key="exp_allow_ow_ad")
+                exp_min_dist = st.slider("Min dist", 1, 50, st.session_state.custom_defaults['adaptive_min_dist'], 1, key="exp_min_dist",
+                    help="Minimum distance (in pixels) between watershed seed points. Higher values = fewer seeds = larger, simpler regions. Default 10.")
+                exp_density = st.slider("Density", 1, 20, st.session_state.custom_defaults['adaptive_density'], 1, key="exp_density",
+                    help="How many annotation points must be nearby for a region to be 'densely annotated'. Areas below this get coarser regions. Default 5.")
+                exp_allow_ow = st.checkbox("Overwrite", value=False, key="exp_allow_ow_ad",
+                    help="When ON, later rounds can overwrite earlier labels if the new round has higher confidence. Leave OFF unless you see obvious mislabeling.")
             seg_params = {'scales': exp_scale_values, 'min_distance': exp_min_dist, 'density_threshold': exp_density, 'allow_overwrite': exp_allow_ow}
             
         elif seg_method == "📊 Graph-based (Felzenszwalb)":
@@ -1624,10 +1945,11 @@ else:
                 )
                 exp_scale_values.append(val)
             with st.expander("⚙️ Advanced", expanded=False):
-                exp_allow_ow_g = st.checkbox("Overwrite", value=False, key="exp_allow_ow_g")
+                exp_allow_ow_g = st.checkbox("Overwrite", value=False, key="exp_allow_ow_g",
+                    help="When ON, later rounds can overwrite earlier labels if the new round has higher confidence. Leave OFF unless you see obvious mislabeling.")
             seg_params = {'scales': exp_scale_values, 'allow_overwrite': exp_allow_ow_g}
         
-        else:  # Hybrid
+        elif seg_method == "🔀 Hybrid (SLIC + Graph)":
             st.caption("**S** = Superpixel (count), **G** = Graph (threshold)")
             exp_round_configs = []
             
@@ -1679,23 +2001,135 @@ else:
                 })
             
             with st.expander("⚙️ Advanced", expanded=False):
-                exp_h_allow_ow = st.checkbox("Overwrite", value=False, key="exp_hybrid_ow")
+                exp_h_allow_ow = st.checkbox("Overwrite", value=False, key="exp_hybrid_ow",
+                    help="When ON, later rounds can overwrite earlier labels if the new round has higher confidence. Leave OFF unless you see obvious mislabeling.")
             
             seg_params = {
                 'round_configs': exp_round_configs,
                 'allow_overwrite': exp_h_allow_ow
             }
         
+        else:  # Graph-First (Anchor + Fill)
+            st.markdown("**Phase 1: Discovery**")
+            exp_gf_discovery_scale = st.select_slider(
+                "Discovery scale",
+                options=LOG_OPTIONS_5K,
+                value=1000,
+                key="exp_gf_discovery",
+                help="Felzenszwalb scale for the discovery phase. Higher values create fewer, larger regions that represent "
+                     "the most obvious objects. These become 'anchor' labels that fill-in rounds respect. "
+                     "Try 500 for more detail, 2000+ for only the most prominent objects."
+            )
+            
+            st.markdown("**Phase 2: Fill-in**")
+            exp_gf_fill_method = st.radio(
+                "Fill method",
+                ["Superpixel", "Graph"],
+                horizontal=True,
+                key="exp_gf_fill_method",
+                help="Superpixel (SLIC) for clean edges, Graph (Felzenszwalb) for natural texture boundaries."
+            )
+            exp_gf_fill_key = "graph_first_sp" if exp_gf_fill_method == "Superpixel" else "graph_first_gr"
+            exp_gf_fill_options = LOG_OPTIONS_10K if exp_gf_fill_method == "Superpixel" else LOG_OPTIONS_5K
+            
+            # Initialize fill-round base values
+            exp_gf_fill_base = init_base_values("exp", exp_gf_fill_key, exp_num_rounds)
+            exp_gf_fill_display = get_display_values(exp_gf_fill_base, exp_scale_factor, exp_gf_fill_key, exp_use_smart, exp_gf_fill_options)
+            
+            exp_gf_fill_values = []
+            for i in range(exp_num_rounds):
+                def make_exp_gf_callback(idx, mkey, pscale, adapt):
+                    def cb():
+                        widget_key = f"exp_gf_fill_{idx}"
+                        if widget_key in st.session_state:
+                            update_base_from_display("exp", mkey, idx, st.session_state[widget_key], pscale, adapt)
+                    return cb
+                
+                val = st.select_slider(
+                    f"Fill {i+1}",
+                    options=exp_gf_fill_options,
+                    value=exp_gf_fill_display[i],
+                    key=f"exp_gf_fill_{i}",
+                    on_change=make_exp_gf_callback(i, exp_gf_fill_key, exp_scale_factor, exp_use_smart)
+                )
+                exp_gf_fill_values.append(val)
+            
+            with st.expander("⚙️ Advanced", expanded=False):
+                exp_gf_allow_ow = st.checkbox("Allow fill to overwrite anchors", value=False, key="exp_gf_ow",
+                    help="When OFF (default), fill-in rounds only label pixels the discovery round left unlabeled. "
+                         "When ON, fill-in rounds can overwrite discovery labels.")
+            
+            seg_params = {
+                'discovery_scale': exp_gf_discovery_scale,
+                'fill_method': 'superpixel' if exp_gf_fill_method == 'Superpixel' else 'graph',
+                'fill_values': exp_gf_fill_values,
+                'allow_overwrite': exp_gf_allow_ow
+            }
+        
+        # Region merging (graph/hybrid/graph_first only)
+        exp_merge_params = None
+        if exp_method_key in ("graph", "hybrid", "graph_first"):
+            exp_merge_enabled = st.checkbox(
+                "Enable region merging", value=True, key="exp_merge_enabled",
+                help="Felzenszwalb graph segmentation often produces hundreds or thousands of tiny fragments per object instead of one clean region. "
+                     "Region merging is a postprocessing step that consolidates those fragments into coherent, object-level masks. "
+                     "This is strongly recommended when exporting to Roboflow, because without merging each tiny fragment becomes a separate annotation, "
+                     "which is unusable for training. With merging enabled, you typically go from thousands of segments down to tens."
+            )
+            if exp_merge_enabled:
+                with st.expander("🔗 Merge settings", expanded=False):
+                    exp_merge_min_area = st.slider("Min area (speckle removal)", 10, 2000, 100, 10,
+                        key="exp_merge_min_area",
+                        help="Any isolated region (connected group of same-class pixels) smaller than this many pixels is removed entirely and set to background. "
+                             "This cleans up tiny specks and noise that Felzenszwalb leaves behind -- single pixels, small dots, sensor noise artifacts. "
+                             "These specks would each become a tiny, useless annotation in Roboflow. "
+                             "Higher values remove more aggressively (but may delete legitimately small objects). "
+                             "Default 100 is conservative. Increase to 300-500 if you still see many tiny speckles.")
+                    exp_merge_small = st.slider("Small region merge", 50, 5000, 500, 50,
+                        key="exp_merge_small",
+                        help="After speckle removal, regions of the same class that are still smaller than this pixel count get merged into their nearest same-class neighbor. "
+                             "This dramatically reduces the number of separate instances per class, turning many scattered fragments into a few coherent objects. "
+                             "Higher values = more aggressive merging (larger fragments get absorbed). "
+                             "Default 500 works well. Increase to 1000-2000 if you want fewer, larger objects. Decrease if small separate objects are important.")
+                    exp_merge_color = st.slider("Color similarity threshold", 0.0, 100.0, 30.0, 5.0,
+                        key="exp_merge_color",
+                        help="After size-based merging, this step looks at adjacent regions of the same class and merges them if their average colors are similar enough. "
+                             "The value is the maximum Euclidean distance in RGB color space (0-255 per channel) between two regions' mean colors. "
+                             "Higher values = merge more aggressively (even regions with somewhat different colors). Set to 0 to disable. "
+                             "Default 30 merges visually similar regions. Increase to 50-80 for more merging, decrease to 10-15 to only merge near-identical colors.")
+                    exp_merge_morph = st.slider("Morph close kernel", 0, 51, 5, 1,
+                        key="exp_merge_morph",
+                        help="Morphological closing is an image processing operation that fills small holes and gaps inside regions. "
+                             "Imagine each class mask as a shape with tiny pin-holes and ragged edges -- closing smooths those out by expanding the shape slightly, then shrinking it back. "
+                             "The kernel size controls how large the 'fill brush' is (in pixels on the processed image): larger values fill bigger gaps but may also merge regions that should stay separate. "
+                             "IMPORTANT: this value is in processed-image pixels, so it depends on your Processing Scale. "
+                             "At 20%% scale, kernel 5 covers ~25 original pixels. At 100%% scale, kernel 5 only covers 5 original pixels -- "
+                             "so at high scales you may need kernel 15-30+ to get the same physical gap-filling effect. "
+                             "This runs BEFORE speckle removal and size-based merging. Set to 0 to skip. Default 5 is good at low scales (0.2-0.4). "
+                             "At higher scales (0.6+), try 11-25. Values above 30 are aggressive and may over-smooth boundaries.")
+                exp_merge_params = {
+                    'min_area': exp_merge_min_area,
+                    'small_region_merge': exp_merge_small,
+                    'color_threshold': exp_merge_color,
+                    'morph_close_ksize': exp_merge_morph
+                }
+        
         # Confidence filtering (optional for export)
         exp_conf_enabled = st.checkbox(
             "Enable confidence filtering (slower)", value=False, key="exp_conf_enabled",
-            help="Adds extra processing time but lets you filter uncertain segments before export."
+            help="Calculates a confidence score (0-100) for each labeled region based on how well it matches the nearby annotation points. "
+                 "Regions far from any annotation point, or where the label disagrees with nearby points, get low confidence. "
+                 "This adds noticeable processing time per image because it must analyze every region's relationship to every annotation point. "
+                 "Use this when you want to remove uncertain or likely-incorrect labels from your export before sending to Roboflow."
         )
         if exp_conf_enabled:
             exp_conf_threshold = st.slider(
                 "Confidence threshold", 0, 100, 40, 5,
                 key="exp_conf_threshold",
-                help="Exclude regions with confidence below this value from export"
+                help="Regions with a confidence score below this value are removed (set to background) in the exported COCO JSON. "
+                     "Higher threshold = stricter filtering = more regions removed = less coverage but higher quality labels. "
+                     "Lower threshold = keeps more regions including uncertain ones = better coverage but some labels may be wrong. "
+                     "Default 40 is a moderate filter. Try 20 for lenient, 60-80 for strict."
             )
         else:
             exp_conf_threshold = 0
@@ -1704,9 +2138,12 @@ else:
         # Export settings button
         if seg_method == "🔀 Hybrid (SLIC + Graph)":
             exp_hybrid_scale_values = [f"{c['type'][0].upper()}:{c['value']}" for c in exp_round_configs]
-            exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, exp_num_rounds, exp_hybrid_scale_values, seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled)
+            exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, exp_num_rounds, exp_hybrid_scale_values, seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled, exp_merge_params)
+        elif seg_method == "🔍 Graph-First (Anchor + Fill)":
+            exp_gf_display_values = [f"D:{seg_params['discovery_scale']}"] + [f"F:{v}" for v in seg_params['fill_values']]
+            exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, exp_num_rounds, exp_gf_display_values, seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled, exp_merge_params)
         else:
-            exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, exp_num_rounds, exp_scale_values, seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled)
+            exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, exp_num_rounds, exp_scale_values, seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled, exp_merge_params)
         st.download_button(
             "💾 Export Settings",
             exp_settings_txt,
@@ -1760,11 +2197,26 @@ else:
                             scaled_image, scaled_points, st.session_state.labelset, seg_params['scales'],
                             allow_overwrite=seg_params.get('allow_overwrite', False)
                         )
-                    else:  # Hybrid
+                    elif seg_method == "🔀 Hybrid (SLIC + Graph)":
                         final_mask, _ = multi_scale_hybrid_labeling(
                             scaled_image, scaled_points, st.session_state.labelset,
                             seg_params['round_configs'],
                             allow_overwrite=seg_params.get('allow_overwrite', False)
+                        )
+                    else:  # Graph-First
+                        final_mask, _ = multi_scale_graph_first_labeling(
+                            scaled_image, scaled_points, st.session_state.labelset,
+                            discovery_scale=seg_params['discovery_scale'],
+                            fill_method=seg_params['fill_method'],
+                            fill_values=seg_params['fill_values'],
+                            allow_overwrite=seg_params.get('allow_overwrite', False)
+                        )
+                    
+                    # Apply region merging for graph/hybrid/graph_first methods
+                    if exp_merge_params is not None:
+                        final_mask = merge_regions(
+                            final_mask, image=scaled_image,
+                            **exp_merge_params
                         )
                     
                     # Apply confidence filtering if enabled and threshold > 0
@@ -1833,3 +2285,26 @@ else:
                 st.image(overlay, use_container_width=True)
                 coverage = (mask > 0).sum() / mask.size * 100
                 st.caption(f"Coverage: {coverage:.1f}%")
+            
+            # Segment count panel for export preview
+            with st.expander("📊 Segment Counts (for Roboflow)", expanded=False):
+                seg_stats = count_segments(mask)
+                st.markdown(f"**Total segments:** {seg_stats.get('total', 0)}")
+                
+                seg_rows = []
+                for entry in st.session_state.labelset:
+                    cid = int(entry.get('Count', 0))
+                    n = seg_stats.get(cid, 0)
+                    if n <= 0:
+                        continue
+                    seg_rows.append({
+                        'Class': entry.get('Name', entry.get('Short Code', '')),
+                        'Segments': n,
+                    })
+                
+                if seg_rows:
+                    seg_rows.sort(key=lambda x: x['Segments'], reverse=True)
+                    import pandas as _pd
+                    st.dataframe(_pd.DataFrame(seg_rows), use_container_width=True, hide_index=True)
+                
+                st.caption("Each 'segment' is a separate connected-component instance that Roboflow will see as an individual annotation.")

@@ -183,6 +183,103 @@ def load_annotations_from_df(df):
     return {name: group for name, group in df.groupby('Name')}
 
 
+def load_labelset(path):
+    """Load labelset JSON file."""
+    with open(path, 'r') as f:
+        labelset = json.load(f)
+
+    for entry in labelset:
+        short_code = entry.get('Short Code')
+        meta = LABEL_META_BY_SHORT_CODE.get(short_code)
+        if meta:
+            entry['Name'] = meta['Name']
+            entry['Functional Group'] = meta['Functional Group']
+        else:
+            entry.setdefault('Name', short_code)
+            entry.setdefault('Functional Group', 'Unknown')
+
+    return labelset
+
+
+def load_annotations(path):
+    """
+    Load sparse point annotations CSV.
+    
+    Handles CSVs with extra columns - only uses Name, Row, Column, and Label.
+    Label column can be named 'Label', 'Label code', or 'label'.
+    """
+    df = pd.read_csv(path, low_memory=False)
+    
+    label_col = None
+    for col in ['Label', 'Label code', 'label', 'label code']:
+        if col in df.columns:
+            label_col = col
+            break
+    
+    if label_col is None:
+        raise ValueError(f"CSV must have a label column (Label, Label code). Found columns: {list(df.columns)}")
+    
+    if label_col != 'Label':
+        df = df.rename(columns={label_col: 'Label'})
+    
+    required = ['Name', 'Row', 'Column', 'Label']
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV missing required columns: {missing}. Found: {list(df.columns)}")
+    
+    df = df[required].copy()
+    
+    annotations = {}
+    for name, group in df.groupby('Name'):
+        annotations[name] = group
+        normalized = normalize_image_name(name)
+        if normalized != name and normalized not in annotations:
+            annotations[normalized] = group
+    
+    return annotations
+
+
+def load_image_files(path, recursive=False):
+    """Get list of image files from directory."""
+    extensions = ('.jpg', '.jpeg', '.png')
+    
+    if recursive:
+        files = []
+        for root, dirs, filenames in os.walk(path):
+            for f in filenames:
+                if f.lower().endswith(extensions):
+                    files.append(f)
+        return files
+    else:
+        return [f for f in os.listdir(path) if f.lower().endswith(extensions)]
+
+
+def find_image_path(base_path, image_name):
+    """
+    Find the full path to an image, searching recursively in subfolders.
+    Also tries normalized name variants to handle double extensions.
+    """
+    names_to_try = [image_name]
+    normalized = normalize_image_name(image_name)
+    if normalized != image_name:
+        names_to_try.append(normalized)
+    
+    for name in names_to_try:
+        direct_path = os.path.join(base_path, name)
+        if os.path.exists(direct_path):
+            return direct_path
+    
+    for root, dirs, files in os.walk(base_path):
+        for name in names_to_try:
+            if name in files:
+                return os.path.join(root, name)
+        for f in files:
+            if normalize_image_name(f) == normalized:
+                return os.path.join(root, f)
+    
+    return None
+
+
 def scale_image_and_points(image, points_df, scale_factor):
     """Scale image and annotation points by a factor."""
     orig_h, orig_w = image.shape[:2]
@@ -193,3 +290,9 @@ def scale_image_and_points(image, points_df, scale_factor):
     scaled_points['Column'] = (scaled_points['Column'] * scale_factor).round().astype(int)
     scaled_points['Row'] = (scaled_points['Row'] * scale_factor).round().astype(int)
     return scaled_image, scaled_points
+
+
+def rescale_mask(mask, original_image):
+    """Rescale mask back to original image size."""
+    orig_h, orig_w = original_image.shape[:2]
+    return cv2.resize(mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
