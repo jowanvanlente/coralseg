@@ -22,6 +22,7 @@ from adaptive_segmentation import multi_scale_adaptive_labeling
 from graph_segmentation import multi_scale_graph_labeling
 from hybrid_segmentation import multi_scale_hybrid_labeling
 from graph_first_segmentation import multi_scale_graph_first_labeling
+from dinov2_knn import multi_scale_dinov2_knn_labeling
 from coco_export import export_to_coco_dict
 from confidence_scoring import calculate_region_confidence, apply_confidence_threshold, get_confidence_summary
 from region_merging import merge_regions
@@ -800,7 +801,7 @@ if mode == "🔬 Test Segmentation":
         st.markdown("**Segmentation Method**")
         seg_method = st.radio(
             "Method",
-            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)", "🔍 Graph-First (Anchor + Fill)"],
+            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)", "🔍 Graph-First (Anchor + Fill)", "🤖 DINOv2 + KNN"],
             horizontal=False,
             label_visibility="collapsed"
         )
@@ -887,6 +888,27 @@ The number is a **similarity threshold** for merging regions:
 - **G rounds:** Number = merge threshold (higher = larger regions)
 
 **Example:** S:3000 → G:500 → S:100 = Start precise with SLIC, fill gaps with Graph, then coarse SLIC pass.""")
+            
+            elif seg_method == "🤖 DINOv2 + KNN":
+                with st.expander("ℹ️ How DINOv2 + KNN works", expanded=False):
+                    st.markdown("""**DINOv2 + KNN Segmentation (foundation model features)**
+
+**Basic idea:** Use a pretrained DINOv2 vision transformer to extract a rich feature vector for every pixel, then propagate your sparse point labels to all pixels using K-Nearest Neighbors in feature space.
+
+**When to use it:**
+- When traditional color/boundary methods fail (e.g. visually similar but semantically different regions).
+- When you want the model to "understand" what it sees, not just follow edges.
+
+**How it works:**
+1. **Feature extraction:** DINOv2 ViT-S/14 processes the image into 14×14-pixel patches, producing a 384-dimensional feature vector per patch. These are upsampled to full resolution.
+2. **Label propagation:** For each of your annotated points, the feature vector at that pixel is looked up. A KNN classifier is fit on these labeled features, then predicts every pixel's class.
+
+**K parameter:**
+- **K=1:** Each pixel gets the label of its single nearest labeled point in feature space. Most precise but noisy.
+- **K=5 (default):** Majority vote of 5 nearest neighbors. Good balance.
+- **K=10-20:** Smoother results, may blur boundaries.
+
+**Performance:** Feature extraction takes ~5-10 seconds per image. Changing K is instant because features are cached.""")
             
             else:  # Graph-First
                 with st.expander("ℹ️ How Graph-First works", expanded=False):
@@ -1031,22 +1053,29 @@ The number is a **similarity threshold** for merging regions:
         elif seg_method == "🔀 Hybrid (SLIC + Graph)":
             method_key = "hybrid"
             options = LOG_OPTIONS_10K  # Will be dynamic per round
+        elif seg_method == "🤖 DINOv2 + KNN":
+            method_key = "dinov2_knn"
+            options = []
         else:  # Graph-First
             method_key = "graph_first"
             options = LOG_OPTIONS_5K  # Discovery scale uses graph options
         
-        # Initialize base values (persistent, at 100% scale)
-        base_values = init_base_values("test", method_key, num_rounds)
-        
-        # Derive display values from base values
-        display_values = get_display_values(base_values, scale_factor, method_key, use_smart, options)
+        if method_key == "dinov2_knn":
+            base_values = []
+            display_values = []
+        else:
+            # Initialize base values (persistent, at 100% scale)
+            base_values = init_base_values("test", method_key, num_rounds)
+            
+            # Derive display values from base values
+            display_values = get_display_values(base_values, scale_factor, method_key, use_smart, options)
         
         # Track scale changes - when adapt is ON and scale changes, update widget keys BEFORE widget creation
         test_scale_track = "test_last_scale_track"
         if test_scale_track not in st.session_state:
             st.session_state[test_scale_track] = scale_factor
         
-        if use_smart and st.session_state[test_scale_track] != scale_factor and method_key not in ("hybrid", "graph_first"):
+        if use_smart and st.session_state[test_scale_track] != scale_factor and method_key not in ("hybrid", "graph_first", "dinov2_knn"):
             st.session_state[test_scale_track] = scale_factor
             # Pre-set widget keys to new display values (before widgets are created)
             prefixes = {"superpixel": "test_sp_", "adaptive": "test_ad_", "graph": "test_gr_"}
@@ -1221,7 +1250,7 @@ The number is a **similarity threshold** for merging regions:
                 'allow_overwrite': h_allow_ow
             }
         
-        else:  # Graph-First (Anchor + Fill)
+        elif seg_method == "🔍 Graph-First (Anchor + Fill)":
             st.markdown("**Phase 1: Discovery**")
             gf_discovery_scale = st.select_slider(
                 "Discovery scale",
@@ -1282,6 +1311,16 @@ The number is a **similarity threshold** for merging regions:
                 'fill_values': gf_fill_values,
                 'allow_overwrite': gf_allow_ow
             }
+        
+        elif seg_method == "🤖 DINOv2 + KNN":
+            st.caption("K controls how many neighboring pixels influence each prediction")
+            k_value = st.slider("K neighbors", 1, 20, 5, 1,
+                key="test_k",
+                help="Number of nearest neighbors to consider when propagating labels. "
+                     "Lower values (1-3) create more precise, local predictions that follow patterns closely. "
+                     "Higher values (10-20) create smoother, more robust results that are less sensitive to noise but may blur boundaries. "
+                     "Default 5 is a good balance. Changing K is instant after the initial feature extraction.")
+            seg_params = {'k': k_value}
         
         # Region merging (graph/hybrid/graph_first only)
         merge_params = None
@@ -1366,6 +1405,8 @@ The number is a **similarity threshold** for merging regions:
         elif seg_method == "🔍 Graph-First (Anchor + Fill)":
             gf_display_values = [f"D:{seg_params['discovery_scale']}"] + [f"F:{v}" for v in seg_params['fill_values']]
             settings_txt = format_settings_txt(seg_method, scale_factor, num_rounds, gf_display_values, seg_params, use_smart, conf_threshold, conf_enabled, merge_params)
+        elif seg_method == "🤖 DINOv2 + KNN":
+            settings_txt = format_settings_txt(seg_method, scale_factor, 1, [f"K:{seg_params['k']}"], seg_params, use_smart, conf_threshold, conf_enabled, None)
         else:
             settings_txt = format_settings_txt(seg_method, scale_factor, num_rounds, scale_values, seg_params, use_smart, conf_threshold, conf_enabled, merge_params)
         st.download_button(
@@ -1565,6 +1606,12 @@ The number is a **similarity threshold** for merging regions:
                         seg_params['round_configs'],
                         allow_overwrite=seg_params.get('allow_overwrite', False)
                     )
+                elif seg_method == "🤖 DINOv2 + KNN":
+                    with st.spinner("Extracting DINOv2 features (this may take 5-10 seconds)..."):
+                        final_mask, intermediate = multi_scale_dinov2_knn_labeling(
+                            scaled_image, scaled_points, st.session_state.labelset,
+                            k=seg_params['k']
+                        )
                 else:  # Graph-First
                     final_mask, intermediate = multi_scale_graph_first_labeling(
                         scaled_image, scaled_points, st.session_state.labelset,
@@ -1672,6 +1719,9 @@ A single segmentation pass would leave large gaps between annotation points. By 
             from skimage.segmentation import mark_boundaries
             
             fig, axes = plt.subplots(2, len(intermediate), figsize=(14, 7))
+            axes = np.array(axes)
+            if axes.ndim == 1:
+                axes = axes[:, np.newaxis]
             image_rgb = cv2.cvtColor(scaled_image, cv2.COLOR_BGR2RGB)
             
             for i, result in enumerate(intermediate):
@@ -1758,7 +1808,7 @@ else:
         st.markdown("**Segmentation Method**")
         seg_method = st.radio(
             "Method",
-            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)", "🔍 Graph-First (Anchor + Fill)"],
+            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)", "🔍 Graph-First (Anchor + Fill)", "🤖 DINOv2 + KNN"],
             key="export_method", label_visibility="collapsed"
         )
         if seg_method == "🔷 Superpixel (SLIC)":
@@ -1769,6 +1819,8 @@ else:
             st.caption("Graph-based: uses Felzenszwalb's algorithm to merge pixels by color/texture similarity into regions, then labels each region from your points. Follows natural boundaries well but produces many small fragments -- use Region Merging (below) to consolidate.")
         elif seg_method == "🔀 Hybrid (SLIC + Graph)":
             st.caption("Hybrid: lets you choose Superpixel (S) or Graph (G) independently for each round. Useful when you want SLIC's clean regions for an initial pass and Graph's texture-following for gap-filling, or vice versa.")
+        elif seg_method == "🤖 DINOv2 + KNN":
+            st.caption("DINOv2 + KNN: uses a pretrained foundation model to extract semantic features from every pixel, then propagates your sparse labels using K-Nearest Neighbors. State-of-the-art semantic understanding but slower (~5-10 seconds per image).")
         else:
             st.caption("Graph-First: discovers the obvious coherent objects with a high-scale Felzenszwalb pass first, then fills remaining areas with progressive rounds. Anchored discovery labels are preserved during fill-in.")
         
@@ -1853,22 +1905,29 @@ else:
         elif seg_method == "🔀 Hybrid (SLIC + Graph)":
             exp_method_key = "hybrid"
             exp_options = LOG_OPTIONS_10K
+        elif seg_method == "🤖 DINOv2 + KNN":
+            exp_method_key = "dinov2_knn"
+            exp_options = []
         else:  # Graph-First
             exp_method_key = "graph_first"
             exp_options = LOG_OPTIONS_5K
         
-        # Initialize base values (persistent, at 100% scale)
-        exp_base_values = init_base_values("exp", exp_method_key, exp_num_rounds)
-        
-        # Derive display values from base values
-        exp_display_values = get_display_values(exp_base_values, exp_scale_factor, exp_method_key, exp_use_smart, exp_options)
+        if exp_method_key == "dinov2_knn":
+            exp_base_values = []
+            exp_display_values = []
+        else:
+            # Initialize base values (persistent, at 100% scale)
+            exp_base_values = init_base_values("exp", exp_method_key, exp_num_rounds)
+            
+            # Derive display values from base values
+            exp_display_values = get_display_values(exp_base_values, exp_scale_factor, exp_method_key, exp_use_smart, exp_options)
         
         # Track scale changes - when adapt is ON and scale changes, update widget keys BEFORE widget creation
         exp_scale_track = "exp_last_scale_track"
         if exp_scale_track not in st.session_state:
             st.session_state[exp_scale_track] = exp_scale_factor
         
-        if exp_use_smart and st.session_state[exp_scale_track] != exp_scale_factor and exp_method_key not in ("hybrid", "graph_first"):
+        if exp_use_smart and st.session_state[exp_scale_track] != exp_scale_factor and exp_method_key not in ("hybrid", "graph_first", "dinov2_knn"):
             st.session_state[exp_scale_track] = exp_scale_factor
             # Pre-set widget keys to new display values (before widgets are created)
             prefixes = {"superpixel": "exp_sp_", "adaptive": "exp_ad_", "graph": "exp_gr_"}
@@ -2009,7 +2068,7 @@ else:
                 'allow_overwrite': exp_h_allow_ow
             }
         
-        else:  # Graph-First (Anchor + Fill)
+        elif seg_method == "🔍 Graph-First (Anchor + Fill)":
             st.markdown("**Phase 1: Discovery**")
             exp_gf_discovery_scale = st.select_slider(
                 "Discovery scale",
@@ -2065,6 +2124,16 @@ else:
                 'fill_values': exp_gf_fill_values,
                 'allow_overwrite': exp_gf_allow_ow
             }
+        
+        elif seg_method == "🤖 DINOv2 + KNN":
+            st.caption("K controls how many neighboring pixels influence each prediction")
+            exp_k_value = st.slider("K neighbors", 1, 20, 5, 1,
+                key="exp_k",
+                help="Number of nearest neighbors to consider when propagating labels. "
+                     "Lower values (1-3) create more precise, local predictions. "
+                     "Higher values (10-20) create smoother, more robust results but may blur boundaries. "
+                     "Default 5 is a good balance. Changing K is instant after initial feature extraction.")
+            seg_params = {'k': exp_k_value}
         
         # Region merging (graph/hybrid/graph_first only)
         exp_merge_params = None
@@ -2142,6 +2211,8 @@ else:
         elif seg_method == "🔍 Graph-First (Anchor + Fill)":
             exp_gf_display_values = [f"D:{seg_params['discovery_scale']}"] + [f"F:{v}" for v in seg_params['fill_values']]
             exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, exp_num_rounds, exp_gf_display_values, seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled, exp_merge_params)
+        elif seg_method == "🤖 DINOv2 + KNN":
+            exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, 1, [f"K:{seg_params['k']}"], seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled, None)
         else:
             exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, exp_num_rounds, exp_scale_values, seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled, exp_merge_params)
         st.download_button(
@@ -2202,6 +2273,11 @@ else:
                             scaled_image, scaled_points, st.session_state.labelset,
                             seg_params['round_configs'],
                             allow_overwrite=seg_params.get('allow_overwrite', False)
+                        )
+                    elif seg_method == "🤖 DINOv2 + KNN":
+                        final_mask, _ = multi_scale_dinov2_knn_labeling(
+                            scaled_image, scaled_points, st.session_state.labelset,
+                            k=seg_params['k']
                         )
                     else:  # Graph-First
                         final_mask, _ = multi_scale_graph_first_labeling(
