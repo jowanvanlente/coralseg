@@ -1672,7 +1672,7 @@ The number is a **similarity threshold** for merging regions:
                 st.rerun()
     
     # Detailed results below
-    if has_result and st.session_state.test_result.get('intermediate'):
+    if has_result and st.session_state.test_result.get('intermediate') and seg_method != "🤖 DINOv2 + KNN":
         st.markdown("---")
         with st.expander("📊 Multi-Scale Progression", expanded=False):
             with st.expander("ℹ️ Understanding Multi-Scale Progression", expanded=False):

@@ -8,6 +8,7 @@ import torch
 import torchvision.transforms as transforms
 from sklearn.neighbors import KNeighborsClassifier
 import streamlit as st
+import gc
 
 
 # Cache the DINOv2 model to avoid reloading it multiple times
@@ -46,9 +47,8 @@ def preprocess_image_for_dinov2(image):
     return image_tensor, (h, w), (new_h, new_w)
 
 
-@st.cache_data(show_spinner=False)
 def extract_dinov2_features(image, _model):
-    """Extract DINOv2 patch features from image (cached per image)."""
+    """Extract DINOv2 patch features and keep them at patch resolution."""
     # Preprocess image
     image_tensor, original_size, resized_size = preprocess_image_for_dinov2(image)
     
@@ -78,21 +78,14 @@ def extract_dinov2_features(image, _model):
     # Reshape to spatial grid
     feature_grid = patch_features.reshape(patch_h, patch_w, 384)  # [patch_h, patch_w, 384]
     
-    # Upsample to original image resolution
-    orig_h, orig_w = original_size
-    feature_map = torch.nn.functional.interpolate(
-        feature_grid.permute(2, 0, 1).unsqueeze(0),  # [1, 384, patch_h, patch_w]
-        size=(orig_h, orig_w),
-        mode='bilinear',
-        align_corners=False
-    ).squeeze(0).permute(1, 2, 0)  # [orig_h, orig_w, 384]
-    
-    return feature_map.numpy()
+    return feature_grid.numpy(), original_size
 
 
-def label_pixels_from_knn(feature_map, points_df, labelset, k=5):
-    """Use KNN to propagate labels from sparse points to all pixels."""
+def label_patches_from_knn(feature_map, points_df, labelset, original_size, k=5):
+    """Use KNN to propagate labels from sparse points to patch grid."""
     label_to_id = {entry['Short Code']: int(entry['Count']) for entry in labelset}
+    patch_h, patch_w = feature_map.shape[:2]
+    orig_h, orig_w = original_size
     
     # Extract features and labels for annotated points
     point_features = []
@@ -108,14 +101,24 @@ def label_pixels_from_knn(feature_map, points_df, labelset, k=5):
             
         class_id = label_to_id[label_name]
         
-        # Check bounds
-        if 0 <= row_y < feature_map.shape[0] and 0 <= col < feature_map.shape[1]:
-            feature_vector = feature_map[row_y, col]
+        # Map full-resolution pixel coordinates to nearest patch position
+        if 0 <= row_y < orig_h and 0 <= col < orig_w:
+            if orig_h > 1:
+                patch_y = int(round(row_y * (patch_h - 1) / (orig_h - 1)))
+            else:
+                patch_y = 0
+            if orig_w > 1:
+                patch_x = int(round(col * (patch_w - 1) / (orig_w - 1)))
+            else:
+                patch_x = 0
+            patch_y = np.clip(patch_y, 0, patch_h - 1)
+            patch_x = np.clip(patch_x, 0, patch_w - 1)
+            feature_vector = feature_map[patch_y, patch_x]
             point_features.append(feature_vector)
             point_labels.append(class_id)
     
     if len(point_features) == 0:
-        # Return empty mask if no valid points
+        # Return empty patch mask if no valid points
         return np.zeros(feature_map.shape[:2], dtype=np.uint8)
     
     # Convert to numpy arrays
@@ -129,12 +132,12 @@ def label_pixels_from_knn(feature_map, points_df, labelset, k=5):
     knn = KNeighborsClassifier(n_neighbors=effective_k)
     knn.fit(point_features, point_labels)
     
-    # Predict for all pixels
+    # Predict for all patches
     h, w = feature_map.shape[:2]
     all_features = feature_map.reshape(-1, feature_map.shape[-1])
     predicted_labels = knn.predict(all_features)
     
-    # Reshape back to image dimensions
+    # Reshape back to patch-grid dimensions
     labeled_mask = predicted_labels.reshape(h, w).astype(np.uint8)
     
     return labeled_mask
@@ -149,11 +152,19 @@ def multi_scale_dinov2_knn_labeling(image, points_df, labelset, k=5, **kwargs):
     # Load model (cached)
     model = load_dinov2_model()
     
-    # Extract features
-    feature_map = extract_dinov2_features(image, model)  # cached per image
+    # Extract patch-resolution features
+    feature_map, original_size = extract_dinov2_features(image, model)
     
-    # Apply KNN labeling
-    labeled_mask = label_pixels_from_knn(feature_map, points_df, labelset, k)
+    # Apply KNN labeling at patch resolution
+    patch_mask = label_patches_from_knn(feature_map, points_df, labelset, original_size, k)
+    
+    # Upsample patch labels to full image resolution (nearest-neighbor to preserve class IDs)
+    orig_h, orig_w = original_size
+    labeled_mask = cv2.resize(patch_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+    
+    # Explicitly free feature memory between images (important for large batch processing)
+    del feature_map
+    gc.collect()
     
     # Create intermediate masks list (for consistency with other methods)
     intermediate_masks = [{
