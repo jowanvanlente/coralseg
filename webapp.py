@@ -16,7 +16,14 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from utils import load_labelset_from_json, load_annotations_from_df, scale_image_and_points, normalize_image_name
+from utils import (
+    load_labelset_from_json,
+    load_annotations_from_df,
+    scale_image_and_points,
+    normalize_image_name,
+    split_points_for_evaluation,
+    evaluate_mask_at_points,
+)
 from superpixel_labeling import multi_scale_labeling
 from adaptive_segmentation import multi_scale_adaptive_labeling
 from graph_segmentation import multi_scale_graph_labeling
@@ -1039,6 +1046,11 @@ The number is a **similarity threshold** for merging regions:
                  "For example, at 40%% scale the image has only 16%% of its original pixels, so superpixel counts are reduced proportionally "
                  "to keep region sizes visually similar. Without this, the same superpixel count on a smaller image would create tiny, useless regions. "
                  "When OFF, you control the exact raw values. Leave this ON unless you know exactly what values you need.")
+        evaluation_mode = st.toggle("Enable Evaluation Mode", value=False, key="test_eval_mode",
+            help="When ON, the app performs a stratified 80/20 held-out point evaluation. "
+                 "Only 80% of points are used for segmentation input, and accuracy is measured on the held-out 20%.")
+        if evaluation_mode:
+            st.caption("Evaluation uses a fixed seed (42) and stratified split by class label.")
         
         # Get method key
         if seg_method == "🔷 Superpixel (SLIC)":
@@ -1566,6 +1578,38 @@ The number is a **similarity threshold** for merging regions:
                     st.dataframe(_pd.DataFrame(seg_rows), use_container_width=True, hide_index=True)
                 
                 st.caption("Each 'segment' is a separate connected-component instance that Roboflow will see as an individual annotation.")
+            
+            eval_result = result.get('evaluation')
+            if result.get('evaluation_enabled') and eval_result is not None:
+                st.markdown("---")
+                with st.expander("🧪 Held-Out Point Evaluation", expanded=True):
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        st.metric("Held-out points", int(eval_result.get('n_holdout', 0)))
+                    with c2:
+                        st.metric("Evaluated points", int(eval_result.get('n_evaluated', 0)))
+                    with c3:
+                        st.metric("Overall accuracy", f"{eval_result.get('overall_accuracy', 0.0):.1f}%")
+                    with c4:
+                        st.metric("Correct", int(eval_result.get('n_correct', 0)))
+                    
+                    st.caption(
+                        f"Stratified split: {int(result.get('evaluation_ratio', 0) * 100)}% hold-out | "
+                        f"Seed: {result.get('evaluation_seed', 42)} | "
+                        f"Skipped points: {int(eval_result.get('n_skipped', 0))}"
+                    )
+                    
+                    per_class_rows = eval_result.get('per_class', [])
+                    if per_class_rows:
+                        st.markdown("**Per-class accuracy**")
+                        st.dataframe(pd.DataFrame(per_class_rows), use_container_width=True, hide_index=True)
+                    
+                    confusion_rows = eval_result.get('confusions', [])
+                    if confusion_rows:
+                        st.markdown("**Confusion summary (top mismatches)**")
+                        st.dataframe(pd.DataFrame(confusion_rows[:15]), use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No misclassifications in held-out points.")
         else:
             st.info("👈 Click 'Visualize' to see result")
     
@@ -1583,38 +1627,50 @@ The number is a **similarity threshold** for merging regions:
                 # Scale down
                 scaled_image, scaled_points = scale_image_and_points(image, points_df, scale_factor)
                 
+                eval_seed = 42
+                eval_holdout_ratio = 0.2
+                if evaluation_mode:
+                    train_points, holdout_points = split_points_for_evaluation(
+                        scaled_points,
+                        holdout_ratio=eval_holdout_ratio,
+                        seed=eval_seed
+                    )
+                else:
+                    train_points = scaled_points
+                    holdout_points = scaled_points.iloc[0:0].copy()
+                
                 # Segment
                 if seg_method == "🔷 Superpixel (SLIC)":
                     final_mask, intermediate = multi_scale_labeling(
-                        scaled_image, scaled_points, st.session_state.labelset, seg_params['scales']
+                        scaled_image, train_points, st.session_state.labelset, seg_params['scales']
                     )
                 elif seg_method == "🎯 Adaptive (Density-based)":
                     final_mask, intermediate = multi_scale_adaptive_labeling(
-                        scaled_image, scaled_points, st.session_state.labelset, seg_params['scales'],
+                        scaled_image, train_points, st.session_state.labelset, seg_params['scales'],
                         min_distance=seg_params.get('min_distance', 10),
                         density_threshold=seg_params.get('density_threshold', 5),
                         allow_overwrite=seg_params.get('allow_overwrite', False)
                     )
                 elif seg_method == "📊 Graph-based (Felzenszwalb)":
                     final_mask, intermediate = multi_scale_graph_labeling(
-                        scaled_image, scaled_points, st.session_state.labelset, seg_params['scales'],
+                        scaled_image, train_points, st.session_state.labelset, seg_params['scales'],
                         allow_overwrite=seg_params.get('allow_overwrite', False)
                     )
                 elif seg_method == "🔀 Hybrid (SLIC + Graph)":
                     final_mask, intermediate = multi_scale_hybrid_labeling(
-                        scaled_image, scaled_points, st.session_state.labelset,
+                        scaled_image, train_points, st.session_state.labelset,
                         seg_params['round_configs'],
                         allow_overwrite=seg_params.get('allow_overwrite', False)
                     )
                 elif seg_method == "🤖 DINOv2 + KNN":
                     with st.spinner("Extracting DINOv2 features (this may take 5-10 seconds)..."):
                         final_mask, intermediate = multi_scale_dinov2_knn_labeling(
-                            scaled_image, scaled_points, st.session_state.labelset,
+                            scaled_image, train_points, st.session_state.labelset,
                             k=seg_params['k']
                         )
                 else:  # Graph-First
                     final_mask, intermediate = multi_scale_graph_first_labeling(
-                        scaled_image, scaled_points, st.session_state.labelset,
+                        scaled_image, train_points, st.session_state.labelset,
                         discovery_scale=seg_params['discovery_scale'],
                         fill_method=seg_params['fill_method'],
                         fill_values=seg_params['fill_values'],
@@ -1633,7 +1689,7 @@ The number is a **similarity threshold** for merging regions:
                 # Calculate confidence scores only if enabled
                 if conf_enabled:
                     confidence_map, region_stats = calculate_region_confidence(
-                        final_mask, scaled_points, st.session_state.labelset
+                        final_mask, train_points, st.session_state.labelset
                     )
                     confidence_summary = get_confidence_summary(region_stats)
                 else:
@@ -1649,6 +1705,13 @@ The number is a **similarity threshold** for merging regions:
                         colored_mask[final_mask == class_id] = color_code
                 
                 coverage = (final_mask > 0).sum() / final_mask.size * 100
+                evaluation_result = None
+                if evaluation_mode:
+                    evaluation_result = evaluate_mask_at_points(
+                        final_mask,
+                        holdout_points,
+                        st.session_state.labelset
+                    )
                 
                 # Store result
                 st.session_state.test_result = {
@@ -1660,12 +1723,18 @@ The number is a **similarity threshold** for merging regions:
                     'region_stats': region_stats,
                     'confidence_summary': confidence_summary,
                     'scaled_points': scaled_points,
+                    'train_points': train_points,
+                    'holdout_points': holdout_points,
                     'intermediate': intermediate,
                     'scaled_image': scaled_image,
                     'coverage': coverage,
                     'pre_merge_seg_stats': pre_merge_seg_stats,
                     'post_merge_seg_stats': post_merge_seg_stats,
-                    'merge_applied': merge_params is not None
+                    'merge_applied': merge_params is not None,
+                    'evaluation_enabled': evaluation_mode,
+                    'evaluation_ratio': eval_holdout_ratio,
+                    'evaluation_seed': eval_seed,
+                    'evaluation': evaluation_result
                 }
                 
                 st.success(f"✓ Processed {test_image}")

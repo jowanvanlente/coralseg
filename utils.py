@@ -183,6 +183,131 @@ def load_annotations_from_df(df):
     return {name: group for name, group in df.groupby('Name')}
 
 
+def split_points_for_evaluation(points_df, holdout_ratio=0.2, seed=42):
+    """Stratified train/holdout split by class label for point-level evaluation."""
+    if points_df is None or len(points_df) == 0:
+        empty = points_df.iloc[0:0].copy()
+        return empty, empty
+    
+    if 'Label' not in points_df.columns:
+        raise ValueError("points_df must contain a 'Label' column for stratified splitting.")
+    
+    rng = np.random.RandomState(seed)
+    holdout_indices = []
+    
+    labels = sorted(points_df['Label'].dropna().astype(str).unique().tolist())
+    for label in labels:
+        group = points_df[points_df['Label'].astype(str) == label]
+        n_points = len(group)
+        if n_points <= 1:
+            continue
+        
+        holdout_n = int(np.floor(n_points * holdout_ratio))
+        if holdout_ratio > 0 and holdout_n < 1:
+            holdout_n = 1
+        holdout_n = min(holdout_n, n_points - 1)  # Keep at least one point for training
+        
+        if holdout_n <= 0:
+            continue
+        
+        group_indices = group.index.to_numpy()
+        shuffled = rng.permutation(group_indices)
+        holdout_indices.extend(shuffled[:holdout_n].tolist())
+    
+    holdout_points = points_df.loc[holdout_indices].copy()
+    train_points = points_df.drop(index=holdout_indices).copy()
+    
+    return train_points.reset_index(drop=True), holdout_points.reset_index(drop=True)
+
+
+def evaluate_mask_at_points(mask, points_df, labelset):
+    """Evaluate predicted mask labels at point coordinates."""
+    label_to_id = {entry['Short Code']: int(entry['Count']) for entry in labelset}
+    id_to_short = {int(entry['Count']): entry['Short Code'] for entry in labelset}
+    id_to_name = {int(entry['Count']): entry.get('Name', entry['Short Code']) for entry in labelset}
+    
+    total = 0
+    correct = 0
+    skipped = 0
+    per_class_counts = {}
+    confusion_counts = {}
+    
+    h, w = mask.shape[:2]
+    
+    for _, row in points_df.iterrows():
+        label_name = row['Label']
+        if label_name not in label_to_id:
+            skipped += 1
+            continue
+        
+        col = int(row['Column'])
+        row_y = int(row['Row'])
+        if not (0 <= row_y < h and 0 <= col < w):
+            skipped += 1
+            continue
+        
+        true_id = label_to_id[label_name]
+        pred_id = int(mask[row_y, col])
+        
+        total += 1
+        if true_id not in per_class_counts:
+            per_class_counts[true_id] = {'correct': 0, 'total': 0}
+        per_class_counts[true_id]['total'] += 1
+        
+        if pred_id == true_id:
+            correct += 1
+            per_class_counts[true_id]['correct'] += 1
+        else:
+            key = (true_id, pred_id)
+            confusion_counts[key] = confusion_counts.get(key, 0) + 1
+    
+    overall_accuracy = (correct / total * 100.0) if total > 0 else 0.0
+    
+    per_class_rows = []
+    for class_id, counts in per_class_counts.items():
+        class_total = counts['total']
+        class_correct = counts['correct']
+        class_acc = (class_correct / class_total * 100.0) if class_total > 0 else 0.0
+        per_class_rows.append({
+            'Class': id_to_name.get(class_id, str(class_id)),
+            'Short Code': id_to_short.get(class_id, str(class_id)),
+            'Accuracy (%)': round(class_acc, 1),
+            'Correct': class_correct,
+            'Total': class_total
+        })
+    
+    per_class_rows.sort(key=lambda x: x['Total'], reverse=True)
+    
+    confusion_rows = []
+    for (true_id, pred_id), count in confusion_counts.items():
+        if pred_id == 0:
+            pred_name = 'Unlabeled'
+            pred_short = '0'
+        else:
+            pred_name = id_to_name.get(pred_id, str(pred_id))
+            pred_short = id_to_short.get(pred_id, str(pred_id))
+        
+        confusion_rows.append({
+            'True Class': id_to_name.get(true_id, str(true_id)),
+            'True Short Code': id_to_short.get(true_id, str(true_id)),
+            'Predicted Class': pred_name,
+            'Predicted Short Code': pred_short,
+            'Count': count
+        })
+    
+    confusion_rows.sort(key=lambda x: x['Count'], reverse=True)
+    
+    return {
+        'n_holdout': len(points_df),
+        'n_evaluated': total,
+        'n_skipped': skipped,
+        'n_correct': correct,
+        'overall_accuracy': overall_accuracy,
+        'per_class': per_class_rows,
+        'confusions': confusion_rows
+    }
+
+
 def load_labelset(path):
     """Load labelset JSON file."""
     with open(path, 'r') as f:
