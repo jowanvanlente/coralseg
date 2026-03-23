@@ -47,8 +47,59 @@ def preprocess_image_for_dinov2(image):
     return image_tensor, (h, w), (new_h, new_w)
 
 
-def extract_dinov2_features(image, _model):
-    """Extract DINOv2 patch features and keep them at patch resolution."""
+def denoise_patch_features(feature_grid):
+    """Remove position-dependent artifact noise from DINOv2 patch tokens.
+    
+    Fits a low-rank linear model (2D polynomial basis of patch coordinates)
+    to predict the position-dependent artifact component, then subtracts it.
+    Based on the observation from "Denoising Vision Transformers" (DVT, ECCV 2024)
+    that ViT outputs contain input-independent artifacts from position embeddings.
+    
+    Args:
+        feature_grid: numpy array [patch_h, patch_w, D] of patch features
+    
+    Returns:
+        Denoised feature grid of the same shape
+    """
+    patch_h, patch_w, D = feature_grid.shape
+    N = patch_h * patch_w
+    
+    # Flatten to [N, D]
+    T = feature_grid.reshape(N, D)
+    
+    # Build 2D position basis matrix [N, 6]: (1, y, x, y², x², yx)
+    ys = np.linspace(-1, 1, patch_h)
+    xs = np.linspace(-1, 1, patch_w)
+    yy, xx = np.meshgrid(ys, xs, indexing='ij')  # [patch_h, patch_w]
+    yy = yy.reshape(N)
+    xx = xx.reshape(N)
+    
+    P = np.stack([
+        np.ones(N),   # bias
+        yy,           # y
+        xx,           # x
+        yy ** 2,      # y²
+        xx ** 2,      # x²
+        yy * xx,      # yx
+    ], axis=1).astype(np.float32)  # [N, 6]
+    
+    # Least-squares: W = (P^T P)^{-1} P^T T  ->  artifact = P @ W
+    W, _, _, _ = np.linalg.lstsq(P, T, rcond=None)  # [6, D]
+    artifact = P @ W  # [N, D]
+    
+    # Subtract the position-dependent artifact
+    T_denoised = T - artifact
+    
+    return T_denoised.reshape(patch_h, patch_w, D)
+
+
+def extract_dinov2_features(image, _model, denoise=True):
+    """Extract DINOv2 patch features and keep them at patch resolution.
+    
+    Args:
+        denoise: If True, apply low-rank denoising to remove position-dependent
+                 artifacts from patch tokens (DVT method).
+    """
     # Preprocess image
     image_tensor, original_size, resized_size = preprocess_image_for_dinov2(image)
     
@@ -77,8 +128,13 @@ def extract_dinov2_features(image, _model):
     
     # Reshape to spatial grid
     feature_grid = patch_features.reshape(patch_h, patch_w, 384)  # [patch_h, patch_w, 384]
+    feature_grid = feature_grid.numpy()
     
-    return feature_grid.numpy(), original_size
+    # Apply denoising to remove position-dependent artifacts
+    if denoise:
+        feature_grid = denoise_patch_features(feature_grid)
+    
+    return feature_grid, original_size
 
 
 def label_patches_from_knn(feature_map, points_df, labelset, original_size, k=5):
@@ -143,17 +199,18 @@ def label_patches_from_knn(feature_map, points_df, labelset, original_size, k=5)
     return labeled_mask
 
 
-def multi_scale_dinov2_knn_labeling(image, points_df, labelset, k=5, **kwargs):
+def multi_scale_dinov2_knn_labeling(image, points_df, labelset, k=5, denoise=True, **kwargs):
     """Apply DINOv2 + KNN segmentation.
     
     Args:
         k: Number of neighbors for KNN (default: 5)
+        denoise: If True, apply low-rank denoising to patch tokens (default: True)
     """
     # Load model (cached)
     model = load_dinov2_model()
     
-    # Extract patch-resolution features
-    feature_map, original_size = extract_dinov2_features(image, model)
+    # Extract patch-resolution features (with optional denoising)
+    feature_map, original_size = extract_dinov2_features(image, model, denoise=denoise)
     
     # Apply KNN labeling at patch resolution
     patch_mask = label_patches_from_knn(feature_map, points_df, labelset, original_size, k)

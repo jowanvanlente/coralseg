@@ -8,3 +8,14 @@ ENV/
 *.log
 .DS_Store
 .ipynb_checkpoints/
+
+
+# Image directories
+input/images/
+input/images/**/
+input/images/1_Training/
+input/images/1_Training/**/
+ 
+# Output directories
+output/
+output/**/
