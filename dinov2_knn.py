@@ -199,15 +199,18 @@ def label_patches_from_knn(feature_map, points_df, labelset, original_size, k=5)
     return labeled_mask
 
 
-def multi_scale_dinov2_knn_labeling(image, points_df, labelset, k=5, denoise=True, **kwargs):
+def multi_scale_dinov2_knn_labeling(image, points_df, labelset, k=5, denoise=True, _model=None, **kwargs):
     """Apply DINOv2 + KNN segmentation.
     
     Args:
         k: Number of neighbors for KNN (default: 5)
         denoise: If True, apply low-rank denoising to patch tokens (default: True)
+        _model: Optional pre-loaded DINOv2 model (skips load_dinov2_model if provided).
+                Useful for batch processing outside Streamlit where @st.cache_resource
+                is not available.
     """
-    # Load model (cached)
-    model = load_dinov2_model()
+    # Load model (cached in Streamlit, or use pre-loaded model for batch)
+    model = _model if _model is not None else load_dinov2_model()
     
     # Extract patch-resolution features (with optional denoising)
     feature_map, original_size = extract_dinov2_features(image, model, denoise=denoise)
