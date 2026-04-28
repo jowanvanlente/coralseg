@@ -306,7 +306,7 @@ def update_base_from_display(prefix, method, round_idx, display_val, processing_
             base = display_val
         st.session_state[key][round_idx] = base
 
-def format_settings_txt(method, scale_factor, num_rounds, scale_values, seg_params, adapt_on, conf_threshold=0, conf_enabled=False, merge_params=None):
+def format_settings_txt(method, scale_factor, num_rounds, scale_values, seg_params, adapt_on, conf_threshold=0, conf_enabled=False, merge_params=None, mode_filter_size=None):
     """Format current segmentation settings as a text string for export."""
     from datetime import datetime
     
@@ -344,6 +344,9 @@ def format_settings_txt(method, scale_factor, num_rounds, scale_values, seg_para
         lines.append(f"  Allow Overwrite: {seg_params.get('allow_overwrite', False)}")
     elif "graph" in method.lower():
         lines.append(f"  Allow Overwrite: {seg_params.get('allow_overwrite', False)}")
+    elif "dinov2" in method.lower():
+        if mode_filter_size is not None:
+            lines.append(f"  Mode Filter Size: {mode_filter_size}")
     
     lines.append("")
     lines.append("--- Region Merging ---")
@@ -1332,7 +1335,13 @@ The number is a **similarity threshold** for merging regions:
                      "Lower values (1-3) create more precise, local predictions that follow patterns closely. "
                      "Higher values (10-20) create smoother, more robust results that are less sensitive to noise but may blur boundaries. "
                      "Default 5 is a good balance. Changing K is instant after the initial feature extraction.")
-            seg_params = {'k': k_value}
+            mode_filter_value = st.select_slider("Mode filter size", options=[1, 3, 5, 7, 9, 11], value=3,
+                key="test_mode_filter",
+                help="Kernel size for the majority-vote smoothing filter applied to patch labels before upsampling. "
+                     "Each patch label is replaced by the most common label in its NxN neighbourhood. "
+                     "Larger values produce fewer, more coherent segments but may over-smooth small features. "
+                     "Set to 1 to disable filtering (raw per-patch KNN output). Default 3 is a good balance.")
+            seg_params = {'k': k_value, 'mode_filter_size': mode_filter_value}
         
         # Region merging (graph/hybrid/graph_first only)
         merge_params = None
@@ -1418,7 +1427,7 @@ The number is a **similarity threshold** for merging regions:
             gf_display_values = [f"D:{seg_params['discovery_scale']}"] + [f"F:{v}" for v in seg_params['fill_values']]
             settings_txt = format_settings_txt(seg_method, scale_factor, num_rounds, gf_display_values, seg_params, use_smart, conf_threshold, conf_enabled, merge_params)
         elif seg_method == "🤖 DINOv2 + KNN":
-            settings_txt = format_settings_txt(seg_method, scale_factor, 1, [f"K:{seg_params['k']}"], seg_params, use_smart, conf_threshold, conf_enabled, None)
+            settings_txt = format_settings_txt(seg_method, scale_factor, 1, [f"K:{seg_params['k']}"], seg_params, use_smart, conf_threshold, conf_enabled, None, mode_filter_size=seg_params.get('mode_filter_size', 3))
         else:
             settings_txt = format_settings_txt(seg_method, scale_factor, num_rounds, scale_values, seg_params, use_smart, conf_threshold, conf_enabled, merge_params)
         st.download_button(
@@ -1666,7 +1675,8 @@ The number is a **similarity threshold** for merging regions:
                     with st.spinner("Extracting DINOv2 features (this may take 5-10 seconds)..."):
                         final_mask, intermediate = multi_scale_dinov2_knn_labeling(
                             scaled_image, train_points, st.session_state.labelset,
-                            k=seg_params['k']
+                            k=seg_params['k'],
+                            mode_filter_size=seg_params.get('mode_filter_size', 3)
                         )
                 else:  # Graph-First
                     final_mask, intermediate = multi_scale_graph_first_labeling(
@@ -2202,7 +2212,13 @@ else:
                      "Lower values (1-3) create more precise, local predictions. "
                      "Higher values (10-20) create smoother, more robust results but may blur boundaries. "
                      "Default 5 is a good balance. Changing K is instant after initial feature extraction.")
-            seg_params = {'k': exp_k_value}
+            exp_mode_filter_value = st.select_slider("Mode filter size", options=[1, 3, 5, 7, 9, 11], value=3,
+                key="exp_mode_filter",
+                help="Kernel size for the majority-vote smoothing filter applied to patch labels before upsampling. "
+                     "Each patch label is replaced by the most common label in its NxN neighbourhood. "
+                     "Larger values produce fewer, more coherent segments but may over-smooth small features. "
+                     "Set to 1 to disable filtering (raw per-patch KNN output). Default 3 is a good balance.")
+            seg_params = {'k': exp_k_value, 'mode_filter_size': exp_mode_filter_value}
         
         # Region merging (graph/hybrid/graph_first only)
         exp_merge_params = None
@@ -2281,7 +2297,7 @@ else:
             exp_gf_display_values = [f"D:{seg_params['discovery_scale']}"] + [f"F:{v}" for v in seg_params['fill_values']]
             exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, exp_num_rounds, exp_gf_display_values, seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled, exp_merge_params)
         elif seg_method == "🤖 DINOv2 + KNN":
-            exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, 1, [f"K:{seg_params['k']}"], seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled, None)
+            exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, 1, [f"K:{seg_params['k']}"], seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled, None, mode_filter_size=seg_params.get('mode_filter_size', 3))
         else:
             exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, exp_num_rounds, exp_scale_values, seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled, exp_merge_params)
         st.download_button(
@@ -2346,7 +2362,8 @@ else:
                     elif seg_method == "🤖 DINOv2 + KNN":
                         final_mask, _ = multi_scale_dinov2_knn_labeling(
                             scaled_image, scaled_points, st.session_state.labelset,
-                            k=seg_params['k']
+                            k=seg_params['k'],
+                            mode_filter_size=seg_params.get('mode_filter_size', 3)
                         )
                     else:  # Graph-First
                         final_mask, _ = multi_scale_graph_first_labeling(
