@@ -9,6 +9,8 @@ import torchvision.transforms as transforms
 from sklearn.neighbors import KNeighborsClassifier
 import streamlit as st
 import gc
+from scipy.ndimage import generic_filter
+from scipy.stats import mode as scipy_mode
 
 
 # Cache the DINOv2 model to avoid reloading it multiple times
@@ -137,8 +139,15 @@ def extract_dinov2_features(image, _model, denoise=True):
     return feature_grid, original_size
 
 
-def label_patches_from_knn(feature_map, points_df, labelset, original_size, k=5):
-    """Use KNN to propagate labels from sparse points to patch grid."""
+def label_patches_from_knn(feature_map, points_df, labelset, original_size, k=5,
+                           confidence_threshold=0.0):
+    """Use KNN to propagate labels from sparse points to patch grid.
+    
+    Args:
+        confidence_threshold: Minimum KNN probability for a patch to be labeled.
+            Patches where the top-class probability is below this value are set
+            to 0 (background/unlabeled).  Range 0.0-1.0.  0 = keep everything.
+    """
     label_to_id = {entry['Short Code']: int(entry['Count']) for entry in labelset}
     patch_h, patch_w = feature_map.shape[:2]
     orig_h, orig_w = original_size
@@ -193,18 +202,90 @@ def label_patches_from_knn(feature_map, points_df, labelset, original_size, k=5)
     all_features = feature_map.reshape(-1, feature_map.shape[-1])
     predicted_labels = knn.predict(all_features)
     
+    # Apply probability-based confidence thresholding
+    if confidence_threshold > 0:
+        probabilities = knn.predict_proba(all_features)
+        max_probs = probabilities.max(axis=1)
+        predicted_labels[max_probs < confidence_threshold] = 0
+    
     # Reshape back to patch-grid dimensions
     labeled_mask = predicted_labels.reshape(h, w).astype(np.uint8)
     
     return labeled_mask
 
 
-def multi_scale_dinov2_knn_labeling(image, points_df, labelset, k=5, denoise=True, _model=None, **kwargs):
+def _remove_small_patch_regions(patch_mask, min_patch_region):
+    """Remove connected components in patch grid smaller than min_patch_region patches."""
+    if min_patch_region <= 1:
+        return patch_mask
+    out = patch_mask.copy()
+    for cid in np.unique(out):
+        if cid == 0:
+            continue
+        binary = (out == cid).astype(np.uint8)
+        n_comp, labels = cv2.connectedComponents(binary)
+        for comp in range(1, n_comp):
+            if (labels == comp).sum() < min_patch_region:
+                out[labels == comp] = 0
+    return out
+
+
+def _enforce_max_segments(mask, max_segments):
+    """Remove smallest connected components until total count <= max_segments.
+    
+    Operates on the full-resolution labeled mask.  Iteratively removes the
+    smallest component (by pixel area) across all classes until the total
+    number of connected components is at or below max_segments.
+    """
+    if max_segments <= 0:
+        return mask
+    
+    out = mask.copy()
+    
+    while True:
+        # Count all connected components
+        components = []  # (class_id, comp_label, area, labels_array)
+        for cid in np.unique(out):
+            if cid == 0:
+                continue
+            binary = (out == cid).astype(np.uint8)
+            n_comp, labels = cv2.connectedComponents(binary)
+            for comp in range(1, n_comp):
+                area = (labels == comp).sum()
+                components.append((cid, comp, area, labels))
+        
+        if len(components) <= max_segments:
+            break
+        
+        # Remove the smallest component
+        components.sort(key=lambda x: x[2])
+        _, comp_id, _, comp_labels = components[0]
+        out[comp_labels == comp_id] = 0
+    
+    return out
+
+
+def multi_scale_dinov2_knn_labeling(image, points_df, labelset, k=5, denoise=True,
+                                    mode_filter_size=3, confidence_threshold=0.0,
+                                    min_patch_region=2, max_segments=50,
+                                    _model=None, **kwargs):
     """Apply DINOv2 + KNN segmentation.
     
     Args:
         k: Number of neighbors for KNN (default: 5)
         denoise: If True, apply low-rank denoising to patch tokens (default: True)
+        mode_filter_size: Kernel size for the majority-vote mode filter applied to
+                          patch labels before upsampling. Must be odd. Set to 1 to
+                          disable filtering. (default: 3)
+        confidence_threshold: Minimum KNN probability for a patch to keep its label.
+                              Patches below this are set to background.  Range 0.0-1.0.
+                              0 = keep everything (default: 0.0)
+        min_patch_region: Minimum number of contiguous patches for a region to survive.
+                          Isolated clusters smaller than this are removed before
+                          upsampling. (default: 2)
+        max_segments: Maximum number of connected-component segments in the final mask.
+                      After upsampling, the smallest segments are iteratively removed
+                      until this cap is met.  0 = no cap. (default: 50)
         _model: Optional pre-loaded DINOv2 model (skips load_dinov2_model if provided).
                 Useful for batch processing outside Streamlit where @st.cache_resource
                 is not available.
@@ -215,12 +296,32 @@ def multi_scale_dinov2_knn_labeling(image, points_df, labelset, k=5, denoise=Tru
     # Extract patch-resolution features (with optional denoising)
     feature_map, original_size = extract_dinov2_features(image, model, denoise=denoise)
     
-    # Apply KNN labeling at patch resolution
-    patch_mask = label_patches_from_knn(feature_map, points_df, labelset, original_size, k)
+    # Apply KNN labeling at patch resolution (with optional probability filtering)
+    patch_mask = label_patches_from_knn(
+        feature_map, points_df, labelset, original_size, k,
+        confidence_threshold=confidence_threshold
+    )
+    
+    # Majority-vote filter: collapse noisy per-patch labels into coherent regions.
+    # A 5x5 mode filter replaces each patch label with the most common label in its
+    # neighbourhood, eliminating isolated misclassified patches while preserving
+    # real species boundaries.  Reduces ~1500 tiny segments to ~30-50 regions.
+    def _mode_filter(values):
+        return scipy_mode(values, keepdims=False).mode
+    if mode_filter_size > 1:
+        patch_mask = generic_filter(
+            patch_mask.astype(np.float64), _mode_filter, size=mode_filter_size
+        ).astype(np.uint8)
+    
+    # Remove small isolated patch-level regions before upsampling
+    patch_mask = _remove_small_patch_regions(patch_mask, min_patch_region)
     
     # Upsample patch labels to full image resolution (nearest-neighbor to preserve class IDs)
     orig_h, orig_w = original_size
     labeled_mask = cv2.resize(patch_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+    
+    # Enforce maximum segment count by removing smallest components
+    labeled_mask = _enforce_max_segments(labeled_mask, max_segments)
     
     # Explicitly free feature memory between images (important for large batch processing)
     del feature_map

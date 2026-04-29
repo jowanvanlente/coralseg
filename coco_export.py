@@ -16,9 +16,15 @@ def process_single_image_to_coco(args):
     
     Args:
         args: Tuple of (image_id, image_name, mask, orig_width, orig_height, scale_factor)
+              or (image_id, image_name, mask, orig_width, orig_height, scale_factor, min_component_area)
               Mask is at scaled resolution. Coordinates are rescaled back to original dims.
+              min_component_area: Minimum pixel area for a component to be exported (default 10).
     """
-    image_id, image_name, mask, orig_width, orig_height, scale_factor = args
+    if len(args) == 7:
+        image_id, image_name, mask, orig_width, orig_height, scale_factor, min_component_area = args
+    else:
+        image_id, image_name, mask, orig_width, orig_height, scale_factor = args
+        min_component_area = 10
     
     H, W = mask.shape
     inv_scale = 1.0 / scale_factor
@@ -42,7 +48,7 @@ def process_single_image_to_coco(args):
         for component_id in range(1, num_components):
             component_mask = (component_labels == component_id).astype(np.uint8)
             
-            if component_mask.sum() < 10:
+            if component_mask.sum() < min_component_area:
                 continue
             
             contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -83,10 +89,14 @@ def process_single_image_to_coco(args):
     return image_entry, annotations
 
 
-def export_to_coco_dict(processed_images, labelset):
+def export_to_coco_dict(processed_images, labelset, min_component_area=10):
     """Export processed images to COCO dictionary format.
     
     Used by the webapp where masks are already at original resolution.
+    
+    Args:
+        min_component_area: Minimum pixel area for a component to be exported.
+            Components smaller than this are skipped. (default: 10)
     """
     coco = {'images': [], 'annotations': [], 'categories': []}
     
@@ -95,7 +105,7 @@ def export_to_coco_dict(processed_images, labelset):
     
     all_annotations = []
     for image_id, (image_name, data) in enumerate(processed_images.items(), start=1):
-        args = (image_id, image_name, data['mask'], data['width'], data['height'], 1.0)
+        args = (image_id, image_name, data['mask'], data['width'], data['height'], 1.0, min_component_area)
         image_entry, annotations = process_single_image_to_coco(args)
         coco['images'].append(image_entry)
         all_annotations.extend(annotations)

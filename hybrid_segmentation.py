@@ -23,11 +23,17 @@ def create_graph_segments(scale, image):
     return segments
 
 
-def label_segments_from_points(segments, points_df, labelset):
-    """Label segments based on sparse point annotations."""
+def label_segments_from_points(segments, points_df, labelset, min_votes=1, majority_fraction=0.0):
+    """Label segments based on sparse point annotations.
+    
+    Args:
+        min_votes: Minimum annotation points per segment to assign a label (default: 1)
+        majority_fraction: Minimum fraction of votes for the winning class (default: 0.0)
+    """
     labeled_mask = np.zeros_like(segments, dtype=np.uint8)
     label_to_id = {entry['Short Code']: int(entry['Count']) for entry in labelset}
     
+    segment_votes = {}
     for _, row in points_df.iterrows():
         col = int(row['Column'])
         row_y = int(row['Row'])
@@ -37,7 +43,20 @@ def label_segments_from_points(segments, points_df, labelset):
         class_id = label_to_id[label_name]
         if 0 <= row_y < segments.shape[0] and 0 <= col < segments.shape[1]:
             segment_id = segments[row_y, col]
-            labeled_mask[segments == segment_id] = class_id
+            if segment_id not in segment_votes:
+                segment_votes[segment_id] = {}
+            if class_id not in segment_votes[segment_id]:
+                segment_votes[segment_id][class_id] = 0
+            segment_votes[segment_id][class_id] += 1
+    
+    for segment_id, votes in segment_votes.items():
+        total_votes = sum(votes.values())
+        if total_votes < min_votes:
+            continue
+        winning_class, winning_count = max(votes.items(), key=lambda x: x[1])
+        if majority_fraction > 0 and (winning_count / total_votes) < majority_fraction:
+            continue
+        labeled_mask[segments == segment_id] = winning_class
     return labeled_mask
 
 
@@ -46,7 +65,8 @@ def join_masks(mask_old, mask_new):
     return np.where(mask_old == 0, mask_new, mask_old)
 
 
-def multi_scale_hybrid_labeling(image, points_df, labelset, round_configs, allow_overwrite=False):
+def multi_scale_hybrid_labeling(image, points_df, labelset, round_configs, allow_overwrite=False,
+                                min_votes=1, majority_fraction=0.0):
     """
     Apply multi-scale hybrid labeling with configurable round types.
     
@@ -75,7 +95,8 @@ def multi_scale_hybrid_labeling(image, points_df, labelset, round_configs, allow
         else:  # graph
             segments = create_graph_segments(value, image)
         
-        labeled_mask = label_segments_from_points(segments, points_df, labelset)
+        labeled_mask = label_segments_from_points(segments, points_df, labelset,
+                                                     min_votes=min_votes, majority_fraction=majority_fraction)
         
         if allow_overwrite:
             combined_mask = np.where(labeled_mask > 0, labeled_mask, combined_mask)

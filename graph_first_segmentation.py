@@ -36,7 +36,8 @@ def create_superpixels(image, n_segments, compactness=10, sigma=1):
     return segments
 
 
-def label_segments_from_points(segments, points_df, labelset, return_confidence=False):
+def label_segments_from_points(segments, points_df, labelset, return_confidence=False,
+                               min_votes=1, majority_fraction=0.0):
     """
     Label segments based on sparse point annotations.
     
@@ -48,6 +49,10 @@ def label_segments_from_points(segments, points_df, labelset, return_confidence=
         points_df: DataFrame with 'Column', 'Row', 'Label'
         labelset: Label definitions
         return_confidence: If True, also return vote counts per pixel
+        min_votes: Minimum number of annotation points a segment must contain
+            to receive a label. (default: 1 = original behaviour)
+        majority_fraction: Minimum fraction of votes the winning class must
+            have to label the segment.  0 = no majority requirement. (default: 0.0)
     
     Returns:
         labeled_mask: Mask with class IDs
@@ -80,8 +85,12 @@ def label_segments_from_points(segments, points_df, labelset, return_confidence=
     
     for segment_id, votes in segment_votes.items():
         if votes:
-            winning_class = max(votes.items(), key=lambda x: x[1])[0]
             total_votes = sum(votes.values())
+            if total_votes < min_votes:
+                continue
+            winning_class, winning_count = max(votes.items(), key=lambda x: x[1])
+            if majority_fraction > 0 and (winning_count / total_votes) < majority_fraction:
+                continue
             mask = segments == segment_id
             labeled_mask[mask] = winning_class
             if return_confidence:
@@ -96,7 +105,9 @@ def multi_scale_graph_first_labeling(image, points_df, labelset,
                                       discovery_scale=1000,
                                       fill_method='superpixel',
                                       fill_values=None,
-                                      allow_overwrite=False):
+                                      allow_overwrite=False,
+                                      min_votes=1,
+                                      majority_fraction=0.0):
     """
     Apply Graph-First (Anchor + Fill) segmentation.
     
@@ -133,7 +144,8 @@ def multi_scale_graph_first_labeling(image, points_df, labelset,
     # ===== Phase 1: Discovery =====
     discovery_segments = create_graph_segments(image, scale=discovery_scale)
     discovery_mask, discovery_confidence = label_segments_from_points(
-        discovery_segments, points_df, labelset, return_confidence=True
+        discovery_segments, points_df, labelset, return_confidence=True,
+        min_votes=min_votes, majority_fraction=majority_fraction
     )
     
     # The discovery mask becomes the anchor
@@ -156,7 +168,10 @@ def multi_scale_graph_first_labeling(image, points_df, labelset,
         else:  # graph
             segments = create_graph_segments(image, scale=value)
         
-        labeled_mask = label_segments_from_points(segments, points_df, labelset)
+        labeled_mask = label_segments_from_points(
+            segments, points_df, labelset,
+            min_votes=min_votes, majority_fraction=majority_fraction
+        )
         
         if allow_overwrite:
             # Fill-in can overwrite (not recommended for anchor labels)
