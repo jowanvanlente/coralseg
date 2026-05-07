@@ -237,39 +237,68 @@ with tab_img:
 
     # ---- Outlier detection ----
     st.markdown("---")
-    st.subheader("Outlier images (too many points)")
+    st.subheader("Outlier images (point count out of range)")
 
-    threshold = st.number_input(
-        "Flag images with more than N points", min_value=1, value=150, step=10,
-        help="Normal images have ~100 annotations. Raise this to see only extreme outliers.",
+    col_min, col_max = st.columns(2)
+    min_pts = col_min.number_input(
+        "Minimum points (inclusive)", min_value=0, value=50, step=10,
+        help="Images with fewer than this many points are flagged as outliers.",
+    )
+    max_pts = col_max.number_input(
+        "Maximum points (inclusive)", min_value=0, value=150, step=10,
+        help="Images with more than this many points are flagged as outliers.",
+    )
+
+    exclude_str = st.text_input(
+        "Exclude images whose filename contains (case-insensitive)",
+        value="trainingMM",
+        help="Any image whose normalised name contains this substring will be removed from the cleaned CSV.",
     )
 
     pts_per_img = df.groupby("NameNorm").size().reset_index(name="Points")
-    outliers = pts_per_img[pts_per_img["Points"] > threshold].sort_values("Points", ascending=False).reset_index(drop=True)
+    outliers = pts_per_img[
+        (pts_per_img["Points"] < min_pts) | (pts_per_img["Points"] > max_pts)
+    ].sort_values("Points", ascending=False).reset_index(drop=True)
 
-    if outliers.empty:
-        st.success(f"No images exceed {threshold} points.")
+    # Images excluded by the name-substring filter
+    exclude_lower = exclude_str.strip().lower()
+    if exclude_lower:
+        string_excluded = [n for n in df["NameNorm"].unique() if exclude_lower in n.lower()]
     else:
-        st.warning(f"{len(outliers)} image(s) exceed {threshold} points.")
-        st.dataframe(outliers.rename(columns={"NameNorm": "Image"}), use_container_width=True, hide_index=True)
+        string_excluded = []
 
-        # Download cleaned CSV (outlier images removed)
-        outlier_names = set(outliers["NameNorm"])
-        clean_df = df[~df["NameNorm"].isin(outlier_names)].drop(columns=["NameNorm"])
-        # Restore original column name if needed
+    if outliers.empty and not string_excluded:
+        st.success(f"No outliers found (range: {min_pts}–{max_pts} points, inclusive) and no name-match exclusions.")
+    else:
+        if not outliers.empty:
+            st.warning(f"{len(outliers)} image(s) outside the {min_pts}–{max_pts} range.")
+            st.dataframe(outliers.rename(columns={"NameNorm": "Image"}), use_container_width=True, hide_index=True)
+        if string_excluded:
+            st.warning(f"{len(string_excluded)} image(s) excluded by name filter '{exclude_str}'.")
+
+        # Build cleaned dataframe: remove both outlier and string-excluded images
+        all_excluded = set(outliers["NameNorm"]) | set(string_excluded)
+        clean_df = df[~df["NameNorm"].isin(all_excluded)].drop(columns=["NameNorm"])
         if "Label code" not in clean_df.columns and "Label" in clean_df.columns:
             clean_df = clean_df.rename(columns={"Label": "Label code"})
-        col_a, col_b = st.columns(2)
-        col_a.download_button(
-            "⬇️ Download cleaned CSV (outliers removed)",
-            clean_df.to_csv(index=False).encode("utf-8"),
-            "annotations_cleaned.csv",
-            "text/csv",
-        )
-        col_b.download_button(
-            "⬇️ Download list of outlier filenames",
-            "\n".join(outliers["NameNorm"].tolist()).encode("utf-8"),
-            "outlier_images.txt",
+
+        CLEANED_PATH = ROOT / "input" / "annotations" / "annotations_cleaned.csv"
+
+        if st.button("💾 Save cleaned CSV to disk"):
+            try:
+                clean_df.to_csv(CLEANED_PATH, index=False)
+                st.success(
+                    f"✅ Saved **{len(clean_df):,}** rows to `{CLEANED_PATH}`  \n"
+                    f"Removed: **{len(outliers)}** point-count outlier(s), "
+                    f"**{len(string_excluded)}** name-filter exclusion(s)."
+                )
+            except Exception as e:
+                st.error(f"❌ Could not save file: {e}")
+
+        st.download_button(
+            "⬇️ Download list of excluded filenames",
+            "\n".join(sorted(all_excluded)).encode("utf-8"),
+            "excluded_images.txt",
             "text/plain",
         )
 
