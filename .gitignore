@@ -19,3 +19,7 @@ input/images/1_Training/**/
 # Output directories
 output/
 output/**/
+
+# SAM result images
+*_result.png
+*_result.jpg

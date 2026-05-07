@@ -27,7 +27,7 @@ from utils import (
 ROOT = Path(__file__).parent
 DEFAULT_CSV = ROOT / "input" / "annotations" / "annotations_confirmed.csv"
 DEFAULT_IMG_DIR = ROOT / "input" / "images" / "Training Data"
-LABELSET_PATH = ROOT / "labelset.json"
+LABELSET_PATH = ROOT / "input" / "labelset" / "labelset.json"
 
 st.set_page_config(page_title="CoralSeg Annotation Analysis", layout="wide")
 

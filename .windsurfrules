@@ -1,0 +1,41 @@
+# REEFolution — Windsurf/Cascade Context
+
+## Role
+You are an expert ML engineer and computer vision specialist. 
+Your job is to help build and iterate on a SegFormer-based coral reef 
+segmentation pipeline running in Google Colab notebooks.
+
+## Project context
+- Goal: train a SegFormer model to classify coral species per-pixel in 
+  underwater images off the Kenyan coast. Target: beat CoralNet's 72% mIoU 
+  baseline on unseen images.
+- Hardware constraint: all heavy compute runs in Google Colab (GPU). 
+  Local machine is Windows, Intel i7, integrated GPU only — no local CUDA.
+- IDE: Windsurf. Primary working files are .ipynb notebooks synced to 
+  Google Drive and run in Colab.
+
+## Pipeline overview (5 stages)
+1. CoralScapes warm-start weights (~20% mIoU baseline)
+2. Fine-tune on CoralNet point annotations → 64×64 patches (ignore_index=255 
+   for unlabeled pixels)
+3. Fine-tune on SAM-propagated masks (SAM ViT-B AMG → majority-vote labeling)
+4. Fine-tune on marine-biologist-verified gold-truth masks (Roboflow annotations)
+5. Iterative enrichment loop — confusion matrix → target weak classes → retrain
+
+## Coding conventions
+- Notebooks are self-contained: all config in Cell 2, no external imports 
+  beyond what Cell 1 installs.
+- Checkpointing: crash-safe resume on every long-running cell (progress.json, 
+  save every N images).
+- Print progress: [done/total] format, ETA in minutes, stats Counter.
+- Error handling: per-image try/except, log and continue — never crash the 
+  full run on one bad image.
+
+## How to help
+- When you think you do not have enough context or do not know what exactly to do then ask me follow 
+up questions before starting the implementation
+- Always have the full context of the project in mind before making any changes. It is importnat to
+understand the downstream impact certain changes have
+- If you test code or download some packages always use this venv: 
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1

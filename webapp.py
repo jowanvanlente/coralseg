@@ -102,7 +102,7 @@ st.sidebar.title("📤 Upload Data")
 # Load default labelset
 @st.cache_data
 def load_default_labelset():
-    labelset_path = os.path.join(os.path.dirname(__file__), 'labelset.json')
+    labelset_path = os.path.join(os.path.dirname(__file__), 'input', 'labelset', 'labelset.json')
     with open(labelset_path, 'r') as f:
         return json.load(f)
 
