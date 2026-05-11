@@ -16,20 +16,12 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from utils import (
-    load_labelset_from_json,
-    load_annotations_from_df,
-    scale_image_and_points,
-    normalize_image_name,
-    split_points_for_evaluation,
-    evaluate_mask_at_points,
-)
+from utils import load_labelset_from_json, load_annotations_from_df, scale_image_and_points, normalize_image_name
 from superpixel_labeling import multi_scale_labeling
 from adaptive_segmentation import multi_scale_adaptive_labeling
 from graph_segmentation import multi_scale_graph_labeling
 from hybrid_segmentation import multi_scale_hybrid_labeling
 from graph_first_segmentation import multi_scale_graph_first_labeling
-from dinov2_knn import multi_scale_dinov2_knn_labeling
 from coco_export import export_to_coco_dict
 from confidence_scoring import calculate_region_confidence, apply_confidence_threshold, get_confidence_summary
 from region_merging import merge_regions
@@ -102,7 +94,7 @@ st.sidebar.title("📤 Upload Data")
 # Load default labelset
 @st.cache_data
 def load_default_labelset():
-    labelset_path = os.path.join(os.path.dirname(__file__), 'input', 'labelset', 'labelset.json')
+    labelset_path = os.path.join(os.path.dirname(__file__), 'labelset.json')
     with open(labelset_path, 'r') as f:
         return json.load(f)
 
@@ -306,7 +298,7 @@ def update_base_from_display(prefix, method, round_idx, display_val, processing_
             base = display_val
         st.session_state[key][round_idx] = base
 
-def format_settings_txt(method, scale_factor, num_rounds, scale_values, seg_params, adapt_on, conf_threshold=0, conf_enabled=False, merge_params=None, mode_filter_size=None):
+def format_settings_txt(method, scale_factor, num_rounds, scale_values, seg_params, adapt_on, conf_threshold=0, conf_enabled=False, merge_params=None):
     """Format current segmentation settings as a text string for export."""
     from datetime import datetime
     
@@ -344,9 +336,6 @@ def format_settings_txt(method, scale_factor, num_rounds, scale_values, seg_para
         lines.append(f"  Allow Overwrite: {seg_params.get('allow_overwrite', False)}")
     elif "graph" in method.lower():
         lines.append(f"  Allow Overwrite: {seg_params.get('allow_overwrite', False)}")
-    elif "dinov2" in method.lower():
-        if mode_filter_size is not None:
-            lines.append(f"  Mode Filter Size: {mode_filter_size}")
     
     lines.append("")
     lines.append("--- Region Merging ---")
@@ -376,31 +365,40 @@ def format_settings_txt(method, scale_factor, num_rounds, scale_values, seg_para
 # Sample data loader
 st.sidebar.markdown("### 🎯 Quick Start")
 if st.sidebar.button("📂 Load Sample Data", use_container_width=True, 
-    help="Load 3 sample coral reef images with ~2700 annotations to try the app"):
+    help="Load sample coral reef images with annotations to try the app"):
     sample_dir = os.path.join(os.path.dirname(__file__), 'sample_data')
-    sample_images = ['G0258570.JPG', 'G0258574.JPG', 'G0258577.JPG']
-    sample_csv_path = os.path.join(sample_dir, 'sample_annotations.csv')
+    # Find the CSV file in sample_data/
+    csv_candidates = [f for f in os.listdir(sample_dir) if f.lower().endswith('.csv')] if os.path.isdir(sample_dir) else []
+    # Find image files in sample_data/
+    img_extensions = ('.jpg', '.jpeg', '.png')
+    img_candidates = [f for f in os.listdir(sample_dir) if f.lower().endswith(img_extensions)] if os.path.isdir(sample_dir) else []
     
-    if os.path.exists(sample_csv_path):
-        # Load sample images
-        st.session_state.images = {}
-        loaded_count = 0
-        for img_name in sample_images:
-            img_path = os.path.join(sample_dir, img_name)
-            if os.path.exists(img_path):
-                img = cv2.imread(img_path)
-                st.session_state.images[img_name] = img
-                loaded_count += 1
+    if csv_candidates and img_candidates:
+        sample_csv_path = os.path.join(sample_dir, csv_candidates[0])
         
         # Load sample annotations
         df = pd.read_csv(sample_csv_path, low_memory=False)
         st.session_state.points_dict = load_annotations_from_df(df)
-        total_annotations = sum(len(d) for d in st.session_state.points_dict.values())
         
+        # Load sample images (match filenames via normalize)
+        st.session_state.images = {}
+        loaded_count = 0
+        annotation_names = set(st.session_state.points_dict.keys())
+        for img_file in img_candidates:
+            img_path = os.path.join(sample_dir, img_file)
+            img = cv2.imread(img_path)
+            if img is not None:
+                # Try original name and normalized name for matching
+                norm_name = normalize_image_name(img_file)
+                use_name = norm_name if norm_name in annotation_names else img_file
+                st.session_state.images[use_name] = img
+                loaded_count += 1
+        
+        total_annotations = sum(len(d) for d in st.session_state.points_dict.values())
         st.sidebar.success(f"✓ Sample data loaded! ({loaded_count} images, {total_annotations:,} annotations)")
         st.rerun()
     else:
-        st.sidebar.error("Sample data files not found")
+        st.sidebar.error("Sample data files not found (need at least one CSV and one image in sample_data/)")
 
 st.sidebar.markdown("---")
 
@@ -811,7 +809,7 @@ if mode == "🔬 Test Segmentation":
         st.markdown("**Segmentation Method**")
         seg_method = st.radio(
             "Method",
-            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)", "🔍 Graph-First (Anchor + Fill)", "🤖 DINOv2 + KNN"],
+            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)", "🔍 Graph-First (Anchor + Fill)"],
             horizontal=False,
             label_visibility="collapsed"
         )
@@ -898,27 +896,6 @@ The number is a **similarity threshold** for merging regions:
 - **G rounds:** Number = merge threshold (higher = larger regions)
 
 **Example:** S:3000 → G:500 → S:100 = Start precise with SLIC, fill gaps with Graph, then coarse SLIC pass.""")
-            
-            elif seg_method == "🤖 DINOv2 + KNN":
-                with st.expander("ℹ️ How DINOv2 + KNN works", expanded=False):
-                    st.markdown("""**DINOv2 + KNN Segmentation (foundation model features)**
-
-**Basic idea:** Use a pretrained DINOv2 vision transformer to extract a rich feature vector for every pixel, then propagate your sparse point labels to all pixels using K-Nearest Neighbors in feature space.
-
-**When to use it:**
-- When traditional color/boundary methods fail (e.g. visually similar but semantically different regions).
-- When you want the model to "understand" what it sees, not just follow edges.
-
-**How it works:**
-1. **Feature extraction:** DINOv2 ViT-S/14 processes the image into 14×14-pixel patches, producing a 384-dimensional feature vector per patch. These are upsampled to full resolution.
-2. **Label propagation:** For each of your annotated points, the feature vector at that pixel is looked up. A KNN classifier is fit on these labeled features, then predicts every pixel's class.
-
-**K parameter:**
-- **K=1:** Each pixel gets the label of its single nearest labeled point in feature space. Most precise but noisy.
-- **K=5 (default):** Majority vote of 5 nearest neighbors. Good balance.
-- **K=10-20:** Smoother results, may blur boundaries.
-
-**Performance:** Feature extraction takes ~5-10 seconds per image. Changing K is instant because features are cached.""")
             
             else:  # Graph-First
                 with st.expander("ℹ️ How Graph-First works", expanded=False):
@@ -1049,11 +1026,6 @@ The number is a **similarity threshold** for merging regions:
                  "For example, at 40%% scale the image has only 16%% of its original pixels, so superpixel counts are reduced proportionally "
                  "to keep region sizes visually similar. Without this, the same superpixel count on a smaller image would create tiny, useless regions. "
                  "When OFF, you control the exact raw values. Leave this ON unless you know exactly what values you need.")
-        evaluation_mode = st.toggle("Enable Evaluation Mode", value=False, key="test_eval_mode",
-            help="When ON, the app performs a stratified 80/20 held-out point evaluation. "
-                 "Only 80% of points are used for segmentation input, and accuracy is measured on the held-out 20%.")
-        if evaluation_mode:
-            st.caption("Evaluation uses a fixed seed (42) and stratified split by class label.")
         
         # Get method key
         if seg_method == "🔷 Superpixel (SLIC)":
@@ -1068,29 +1040,22 @@ The number is a **similarity threshold** for merging regions:
         elif seg_method == "🔀 Hybrid (SLIC + Graph)":
             method_key = "hybrid"
             options = LOG_OPTIONS_10K  # Will be dynamic per round
-        elif seg_method == "🤖 DINOv2 + KNN":
-            method_key = "dinov2_knn"
-            options = []
         else:  # Graph-First
             method_key = "graph_first"
             options = LOG_OPTIONS_5K  # Discovery scale uses graph options
         
-        if method_key == "dinov2_knn":
-            base_values = []
-            display_values = []
-        else:
-            # Initialize base values (persistent, at 100% scale)
-            base_values = init_base_values("test", method_key, num_rounds)
-            
-            # Derive display values from base values
-            display_values = get_display_values(base_values, scale_factor, method_key, use_smart, options)
+        # Initialize base values (persistent, at 100% scale)
+        base_values = init_base_values("test", method_key, num_rounds)
+        
+        # Derive display values from base values
+        display_values = get_display_values(base_values, scale_factor, method_key, use_smart, options)
         
         # Track scale changes - when adapt is ON and scale changes, update widget keys BEFORE widget creation
         test_scale_track = "test_last_scale_track"
         if test_scale_track not in st.session_state:
             st.session_state[test_scale_track] = scale_factor
         
-        if use_smart and st.session_state[test_scale_track] != scale_factor and method_key not in ("hybrid", "graph_first", "dinov2_knn"):
+        if use_smart and st.session_state[test_scale_track] != scale_factor and method_key not in ("hybrid", "graph_first"):
             st.session_state[test_scale_track] = scale_factor
             # Pre-set widget keys to new display values (before widgets are created)
             prefixes = {"superpixel": "test_sp_", "adaptive": "test_ad_", "graph": "test_gr_"}
@@ -1194,24 +1159,10 @@ The number is a **similarity threshold** for merging regions:
                          "When ON, a later round can overwrite an earlier label if the new round has higher confidence for that pixel. "
                          "This can improve accuracy in areas where the first round made a poor assignment, but may also cause instability. "
                          "Recommendation: leave OFF for your first attempt, try ON if you see obvious mislabeling.")
-                g_min_votes = st.slider("Min votes per segment", 1, 10, 2, 1,
-                    key="test_gr_min_votes",
-                    help="Minimum number of annotation points that must fall inside a segment for it to be labeled. "
-                         "Segments with fewer points are left as background (unlabeled). "
-                         "1 = original behaviour (any single point labels a whole segment). "
-                         "2+ = requires at least 2 points to agree before labeling. Default 2.")
-                g_majority = st.slider("Majority fraction", 0.0, 1.0, 0.0, 0.1,
-                    key="test_gr_majority",
-                    help="Minimum fraction of votes the winning class must have. "
-                         "E.g. 0.6 means 60%% of points in the segment must agree on the same class. "
-                         "If no class reaches this threshold, the segment is left unlabeled. "
-                         "0 = no majority requirement (original behaviour). 0.6 = moderate. 0.8 = strict.")
             
             seg_params = {
                 'scales': scale_values,
-                'allow_overwrite': g_allow_ow,
-                'min_votes': g_min_votes,
-                'majority_fraction': g_majority
+                'allow_overwrite': g_allow_ow
             }
         
         elif seg_method == "🔀 Hybrid (SLIC + Graph)":
@@ -1273,23 +1224,13 @@ The number is a **similarity threshold** for merging regions:
                          "When ON, a later round can overwrite an earlier label if the new round has higher confidence for that pixel. "
                          "This can improve accuracy in areas where the first round made a poor assignment, but may also cause instability. "
                          "Recommendation: leave OFF for your first attempt, try ON if you see obvious mislabeling.")
-                h_min_votes = st.slider("Min votes per segment", 1, 10, 2, 1,
-                    key="test_hybrid_min_votes",
-                    help="Minimum number of annotation points that must fall inside a segment for it to be labeled. "
-                         "Segments with fewer points are left as background. 2+ = requires agreement. Default 2.")
-                h_majority = st.slider("Majority fraction", 0.0, 1.0, 0.0, 0.1,
-                    key="test_hybrid_majority",
-                    help="Minimum fraction of votes the winning class must have. "
-                         "0 = no requirement. 0.6 = 60%% must agree. Default 0.")
             
             seg_params = {
                 'round_configs': round_configs,
-                'allow_overwrite': h_allow_ow,
-                'min_votes': h_min_votes,
-                'majority_fraction': h_majority
+                'allow_overwrite': h_allow_ow
             }
         
-        elif seg_method == "🔍 Graph-First (Anchor + Fill)":
+        else:  # Graph-First (Anchor + Fill)
             st.markdown("**Phase 1: Discovery**")
             gf_discovery_scale = st.select_slider(
                 "Discovery scale",
@@ -1343,62 +1284,12 @@ The number is a **similarity threshold** for merging regions:
                          "The discovery 'anchor' labels are preserved. This is usually what you want -- the discovery round identifies "
                          "the obvious objects, and fill-in just handles the rest. "
                          "When ON, fill-in rounds can overwrite discovery labels. Only use this if discovery is mislabeling some areas.")
-                gf_min_votes = st.slider("Min votes per segment", 1, 10, 2, 1,
-                    key="test_gf_min_votes",
-                    help="Minimum annotation points per segment to assign a label. "
-                         "1 = original behaviour. 2+ = requires stronger evidence. Default 2.")
-                gf_majority = st.slider("Majority fraction", 0.0, 1.0, 0.0, 0.1,
-                    key="test_gf_majority",
-                    help="Minimum fraction of votes the winning class must have. "
-                         "0 = no requirement. 0.6 = 60%% must agree. Default 0.")
             
             seg_params = {
                 'discovery_scale': gf_discovery_scale,
                 'fill_method': 'superpixel' if gf_fill_method == 'Superpixel' else 'graph',
                 'fill_values': gf_fill_values,
-                'allow_overwrite': gf_allow_ow,
-                'min_votes': gf_min_votes,
-                'majority_fraction': gf_majority
-            }
-        
-        elif seg_method == "🤖 DINOv2 + KNN":
-            st.caption("K controls how many neighboring pixels influence each prediction")
-            k_value = st.slider("K neighbors", 1, 20, 5, 1,
-                key="test_k",
-                help="Number of nearest neighbors to consider when propagating labels. "
-                     "Lower values (1-3) create more precise, local predictions that follow patterns closely. "
-                     "Higher values (10-20) create smoother, more robust results that are less sensitive to noise but may blur boundaries. "
-                     "Default 5 is a good balance. Changing K is instant after the initial feature extraction.")
-            mode_filter_value = st.select_slider("Mode filter size", options=[1, 3, 5, 7, 9, 11], value=5,
-                key="test_mode_filter",
-                help="Kernel size for the majority-vote smoothing filter applied to patch labels before upsampling. "
-                     "Each patch label is replaced by the most common label in its NxN neighbourhood. "
-                     "Larger values produce fewer, more coherent segments but may over-smooth small features. "
-                     "Set to 1 to disable filtering (raw per-patch KNN output). Default 5 is a good balance.")
-            with st.expander("⚙️ Confidence & Segment Control", expanded=True):
-                dino_conf_threshold = st.slider("KNN confidence threshold", 0.0, 1.0, 0.6, 0.05,
-                    key="test_dino_conf",
-                    help="Minimum KNN probability for a patch to keep its label. "
-                         "Patches where the model is less confident than this are set to background (unlabeled). "
-                         "Higher values = only very confident patches are labeled = more empty regions but higher quality. "
-                         "0 = keep everything (original behaviour). 0.6 = moderate. 0.8+ = strict.")
-                dino_min_patch = st.slider("Min patch region size", 1, 10, 2, 1,
-                    key="test_dino_min_patch",
-                    help="Minimum number of contiguous patches for a region to survive. "
-                         "Isolated clusters of fewer patches than this are removed before upsampling. "
-                         "Higher values = more aggressive cleanup of tiny scattered regions. "
-                         "1 = keep everything. 2-3 = remove isolated single patches. Default 2.")
-                dino_max_segments = st.slider("Max segments", 0, 200, 50, 5,
-                    key="test_dino_max_seg",
-                    help="Maximum number of connected-component segments in the final output. "
-                         "After all filtering, if there are still more segments than this, the smallest ones are removed. "
-                         "This guarantees the output stays manageable for model training. "
-                         "0 = no cap. 50 = good default for Roboflow. Decrease for simpler outputs.")
-            seg_params = {
-                'k': k_value, 'mode_filter_size': mode_filter_value,
-                'confidence_threshold': dino_conf_threshold,
-                'min_patch_region': dino_min_patch,
-                'max_segments': dino_max_segments
+                'allow_overwrite': gf_allow_ow
             }
         
         # Region merging (graph/hybrid/graph_first only)
@@ -1484,8 +1375,6 @@ The number is a **similarity threshold** for merging regions:
         elif seg_method == "🔍 Graph-First (Anchor + Fill)":
             gf_display_values = [f"D:{seg_params['discovery_scale']}"] + [f"F:{v}" for v in seg_params['fill_values']]
             settings_txt = format_settings_txt(seg_method, scale_factor, num_rounds, gf_display_values, seg_params, use_smart, conf_threshold, conf_enabled, merge_params)
-        elif seg_method == "🤖 DINOv2 + KNN":
-            settings_txt = format_settings_txt(seg_method, scale_factor, 1, [f"K:{seg_params['k']}"], seg_params, use_smart, conf_threshold, conf_enabled, None, mode_filter_size=seg_params.get('mode_filter_size', 3))
         else:
             settings_txt = format_settings_txt(seg_method, scale_factor, num_rounds, scale_values, seg_params, use_smart, conf_threshold, conf_enabled, merge_params)
         st.download_button(
@@ -1607,36 +1496,52 @@ The number is a **similarity threshold** for merging regions:
                                 f"</div></div>",
                                 unsafe_allow_html=True
                             )
-            # --- Segment count panel ---
+            # --- Segment count panel (always uses filtered_mask) ---
             with st.expander("📊 Segment Counts (for Roboflow)", expanded=True):
                 pre_stats = result.get('pre_merge_seg_stats', {})
                 post_stats = result.get('post_merge_seg_stats', {})
                 merge_applied = result.get('merge_applied', False)
                 
-                if merge_applied and pre_stats.get('total', 0) > 0:
-                    st.markdown(
-                        f"**Before merge:** {pre_stats.get('total', '?')} segments &rarr; "
-                        f"**After merge:** {post_stats.get('total', '?')} segments "
-                        f"(**{pre_stats.get('total',0) - post_stats.get('total',0)}** removed)"
-                    )
-                else:
-                    st.markdown(f"**Total segments:** {post_stats.get('total', '?')}")
+                # Recalculate from the actual displayed mask (after confidence filtering)
+                filtered_seg_stats = count_segments(filtered_mask)
                 
-                # Per-class breakdown table
+                # Build summary line showing the pipeline: raw -> merged -> confidence-filtered
+                parts = []
+                if merge_applied and pre_stats.get('total', 0) > 0:
+                    parts.append(f"**Before merge:** {pre_stats.get('total', '?')}")
+                    parts.append(f"**After merge:** {post_stats.get('total', '?')}")
+                
+                conf_filtering_active = conf_enabled and conf_threshold > 0 and confidence_map is not None
+                if conf_filtering_active:
+                    base_total = post_stats.get('total', 0) if post_stats else pre_stats.get('total', 0)
+                    filtered_total = filtered_seg_stats.get('total', 0)
+                    removed = base_total - filtered_total
+                    if parts:
+                        parts.append(f"**After confidence filter:** {filtered_total} (**{removed}** removed)")
+                    else:
+                        parts.append(f"**Before filter:** {base_total} &rarr; **After filter:** {filtered_total} (**{removed}** removed)")
+                    st.markdown(" &rarr; ".join(parts))
+                elif parts:
+                    merged_removed = pre_stats.get('total', 0) - post_stats.get('total', 0)
+                    st.markdown(" &rarr; ".join(parts) + f" (**{merged_removed}** removed)")
+                else:
+                    st.markdown(f"**Total segments:** {filtered_seg_stats.get('total', '?')}")
+                
+                # Per-class breakdown table (always from filtered mask)
                 seg_rows = []
                 for entry in st.session_state.labelset:
                     cid = int(entry.get('Count', 0))
-                    post_n = post_stats.get(cid, 0)
-                    if post_n <= 0:
+                    filt_n = filtered_seg_stats.get(cid, 0)
+                    if filt_n <= 0:
                         continue
                     row = {
                         'Class': entry.get('Name', entry.get('Short Code', '')),
-                        'Segments': post_n,
+                        'Segments': filt_n,
                     }
                     if merge_applied:
-                        pre_n = pre_stats.get(cid, 0)
-                        row['Before Merge'] = pre_n
-                        row['Reduced'] = pre_n - post_n
+                        row['Before Merge'] = pre_stats.get(cid, 0)
+                    if conf_filtering_active:
+                        row['Before Filter'] = post_stats.get(cid, 0) if merge_applied else pre_stats.get(cid, 0)
                     seg_rows.append(row)
                 
                 if seg_rows:
@@ -1645,38 +1550,6 @@ The number is a **similarity threshold** for merging regions:
                     st.dataframe(_pd.DataFrame(seg_rows), use_container_width=True, hide_index=True)
                 
                 st.caption("Each 'segment' is a separate connected-component instance that Roboflow will see as an individual annotation.")
-            
-            eval_result = result.get('evaluation')
-            if result.get('evaluation_enabled') and eval_result is not None:
-                st.markdown("---")
-                with st.expander("🧪 Held-Out Point Evaluation", expanded=True):
-                    c1, c2, c3, c4 = st.columns(4)
-                    with c1:
-                        st.metric("Held-out points", int(eval_result.get('n_holdout', 0)))
-                    with c2:
-                        st.metric("Evaluated points", int(eval_result.get('n_evaluated', 0)))
-                    with c3:
-                        st.metric("Overall accuracy", f"{eval_result.get('overall_accuracy', 0.0):.1f}%")
-                    with c4:
-                        st.metric("Correct", int(eval_result.get('n_correct', 0)))
-                    
-                    st.caption(
-                        f"Stratified split: {int(result.get('evaluation_ratio', 0) * 100)}% hold-out | "
-                        f"Seed: {result.get('evaluation_seed', 42)} | "
-                        f"Skipped points: {int(eval_result.get('n_skipped', 0))}"
-                    )
-                    
-                    per_class_rows = eval_result.get('per_class', [])
-                    if per_class_rows:
-                        st.markdown("**Per-class accuracy**")
-                        st.dataframe(pd.DataFrame(per_class_rows), use_container_width=True, hide_index=True)
-                    
-                    confusion_rows = eval_result.get('confusions', [])
-                    if confusion_rows:
-                        st.markdown("**Confusion summary (top mismatches)**")
-                        st.dataframe(pd.DataFrame(confusion_rows[:15]), use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("No misclassifications in held-out points.")
         else:
             st.info("👈 Click 'Visualize' to see result")
     
@@ -1694,64 +1567,36 @@ The number is a **similarity threshold** for merging regions:
                 # Scale down
                 scaled_image, scaled_points = scale_image_and_points(image, points_df, scale_factor)
                 
-                eval_seed = 42
-                eval_holdout_ratio = 0.2
-                if evaluation_mode:
-                    train_points, holdout_points = split_points_for_evaluation(
-                        scaled_points,
-                        holdout_ratio=eval_holdout_ratio,
-                        seed=eval_seed
-                    )
-                else:
-                    train_points = scaled_points
-                    holdout_points = scaled_points.iloc[0:0].copy()
-                
                 # Segment
                 if seg_method == "🔷 Superpixel (SLIC)":
                     final_mask, intermediate = multi_scale_labeling(
-                        scaled_image, train_points, st.session_state.labelset, seg_params['scales']
+                        scaled_image, scaled_points, st.session_state.labelset, seg_params['scales']
                     )
                 elif seg_method == "🎯 Adaptive (Density-based)":
                     final_mask, intermediate = multi_scale_adaptive_labeling(
-                        scaled_image, train_points, st.session_state.labelset, seg_params['scales'],
+                        scaled_image, scaled_points, st.session_state.labelset, seg_params['scales'],
                         min_distance=seg_params.get('min_distance', 10),
                         density_threshold=seg_params.get('density_threshold', 5),
                         allow_overwrite=seg_params.get('allow_overwrite', False)
                     )
                 elif seg_method == "📊 Graph-based (Felzenszwalb)":
                     final_mask, intermediate = multi_scale_graph_labeling(
-                        scaled_image, train_points, st.session_state.labelset, seg_params['scales'],
-                        allow_overwrite=seg_params.get('allow_overwrite', False),
-                        min_votes=seg_params.get('min_votes', 1),
-                        majority_fraction=seg_params.get('majority_fraction', 0.0)
+                        scaled_image, scaled_points, st.session_state.labelset, seg_params['scales'],
+                        allow_overwrite=seg_params.get('allow_overwrite', False)
                     )
                 elif seg_method == "🔀 Hybrid (SLIC + Graph)":
                     final_mask, intermediate = multi_scale_hybrid_labeling(
-                        scaled_image, train_points, st.session_state.labelset,
+                        scaled_image, scaled_points, st.session_state.labelset,
                         seg_params['round_configs'],
-                        allow_overwrite=seg_params.get('allow_overwrite', False),
-                        min_votes=seg_params.get('min_votes', 1),
-                        majority_fraction=seg_params.get('majority_fraction', 0.0)
+                        allow_overwrite=seg_params.get('allow_overwrite', False)
                     )
-                elif seg_method == "🤖 DINOv2 + KNN":
-                    with st.spinner("Extracting DINOv2 features (this may take 5-10 seconds)..."):
-                        final_mask, intermediate = multi_scale_dinov2_knn_labeling(
-                            scaled_image, train_points, st.session_state.labelset,
-                            k=seg_params['k'],
-                            mode_filter_size=seg_params.get('mode_filter_size', 3),
-                            confidence_threshold=seg_params.get('confidence_threshold', 0.0),
-                            min_patch_region=seg_params.get('min_patch_region', 2),
-                            max_segments=seg_params.get('max_segments', 50)
-                        )
                 else:  # Graph-First
                     final_mask, intermediate = multi_scale_graph_first_labeling(
-                        scaled_image, train_points, st.session_state.labelset,
+                        scaled_image, scaled_points, st.session_state.labelset,
                         discovery_scale=seg_params['discovery_scale'],
                         fill_method=seg_params['fill_method'],
                         fill_values=seg_params['fill_values'],
-                        allow_overwrite=seg_params.get('allow_overwrite', False),
-                        min_votes=seg_params.get('min_votes', 1),
-                        majority_fraction=seg_params.get('majority_fraction', 0.0)
+                        allow_overwrite=seg_params.get('allow_overwrite', False)
                     )
                 
                 # Apply region merging for graph/hybrid methods
@@ -1766,7 +1611,7 @@ The number is a **similarity threshold** for merging regions:
                 # Calculate confidence scores only if enabled
                 if conf_enabled:
                     confidence_map, region_stats = calculate_region_confidence(
-                        final_mask, train_points, st.session_state.labelset
+                        final_mask, scaled_points, st.session_state.labelset
                     )
                     confidence_summary = get_confidence_summary(region_stats)
                 else:
@@ -1782,13 +1627,6 @@ The number is a **similarity threshold** for merging regions:
                         colored_mask[final_mask == class_id] = color_code
                 
                 coverage = (final_mask > 0).sum() / final_mask.size * 100
-                evaluation_result = None
-                if evaluation_mode:
-                    evaluation_result = evaluate_mask_at_points(
-                        final_mask,
-                        holdout_points,
-                        st.session_state.labelset
-                    )
                 
                 # Store result
                 st.session_state.test_result = {
@@ -1800,25 +1638,19 @@ The number is a **similarity threshold** for merging regions:
                     'region_stats': region_stats,
                     'confidence_summary': confidence_summary,
                     'scaled_points': scaled_points,
-                    'train_points': train_points,
-                    'holdout_points': holdout_points,
                     'intermediate': intermediate,
                     'scaled_image': scaled_image,
                     'coverage': coverage,
                     'pre_merge_seg_stats': pre_merge_seg_stats,
                     'post_merge_seg_stats': post_merge_seg_stats,
-                    'merge_applied': merge_params is not None,
-                    'evaluation_enabled': evaluation_mode,
-                    'evaluation_ratio': eval_holdout_ratio,
-                    'evaluation_seed': eval_seed,
-                    'evaluation': evaluation_result
+                    'merge_applied': merge_params is not None
                 }
                 
                 st.success(f"✓ Processed {test_image}")
                 st.rerun()
     
     # Detailed results below
-    if has_result and st.session_state.test_result.get('intermediate') and seg_method != "🤖 DINOv2 + KNN":
+    if has_result and st.session_state.test_result.get('intermediate'):
         st.markdown("---")
         with st.expander("📊 Multi-Scale Progression", expanded=False):
             with st.expander("ℹ️ Understanding Multi-Scale Progression", expanded=False):
@@ -1865,9 +1697,6 @@ A single segmentation pass would leave large gaps between annotation points. By 
             from skimage.segmentation import mark_boundaries
             
             fig, axes = plt.subplots(2, len(intermediate), figsize=(14, 7))
-            axes = np.array(axes)
-            if axes.ndim == 1:
-                axes = axes[:, np.newaxis]
             image_rgb = cv2.cvtColor(scaled_image, cv2.COLOR_BGR2RGB)
             
             for i, result in enumerate(intermediate):
@@ -1954,7 +1783,7 @@ else:
         st.markdown("**Segmentation Method**")
         seg_method = st.radio(
             "Method",
-            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)", "🔍 Graph-First (Anchor + Fill)", "🤖 DINOv2 + KNN"],
+            ["🔷 Superpixel (SLIC)", "🎯 Adaptive (Density-based)", "📊 Graph-based (Felzenszwalb)", "🔀 Hybrid (SLIC + Graph)", "🔍 Graph-First (Anchor + Fill)"],
             key="export_method", label_visibility="collapsed"
         )
         if seg_method == "🔷 Superpixel (SLIC)":
@@ -1965,8 +1794,6 @@ else:
             st.caption("Graph-based: uses Felzenszwalb's algorithm to merge pixels by color/texture similarity into regions, then labels each region from your points. Follows natural boundaries well but produces many small fragments -- use Region Merging (below) to consolidate.")
         elif seg_method == "🔀 Hybrid (SLIC + Graph)":
             st.caption("Hybrid: lets you choose Superpixel (S) or Graph (G) independently for each round. Useful when you want SLIC's clean regions for an initial pass and Graph's texture-following for gap-filling, or vice versa.")
-        elif seg_method == "🤖 DINOv2 + KNN":
-            st.caption("DINOv2 + KNN: uses a pretrained foundation model to extract semantic features from every pixel, then propagates your sparse labels using K-Nearest Neighbors. State-of-the-art semantic understanding but slower (~5-10 seconds per image).")
         else:
             st.caption("Graph-First: discovers the obvious coherent objects with a high-scale Felzenszwalb pass first, then fills remaining areas with progressive rounds. Anchored discovery labels are preserved during fill-in.")
         
@@ -2051,29 +1878,22 @@ else:
         elif seg_method == "🔀 Hybrid (SLIC + Graph)":
             exp_method_key = "hybrid"
             exp_options = LOG_OPTIONS_10K
-        elif seg_method == "🤖 DINOv2 + KNN":
-            exp_method_key = "dinov2_knn"
-            exp_options = []
         else:  # Graph-First
             exp_method_key = "graph_first"
             exp_options = LOG_OPTIONS_5K
         
-        if exp_method_key == "dinov2_knn":
-            exp_base_values = []
-            exp_display_values = []
-        else:
-            # Initialize base values (persistent, at 100% scale)
-            exp_base_values = init_base_values("exp", exp_method_key, exp_num_rounds)
-            
-            # Derive display values from base values
-            exp_display_values = get_display_values(exp_base_values, exp_scale_factor, exp_method_key, exp_use_smart, exp_options)
+        # Initialize base values (persistent, at 100% scale)
+        exp_base_values = init_base_values("exp", exp_method_key, exp_num_rounds)
+        
+        # Derive display values from base values
+        exp_display_values = get_display_values(exp_base_values, exp_scale_factor, exp_method_key, exp_use_smart, exp_options)
         
         # Track scale changes - when adapt is ON and scale changes, update widget keys BEFORE widget creation
         exp_scale_track = "exp_last_scale_track"
         if exp_scale_track not in st.session_state:
             st.session_state[exp_scale_track] = exp_scale_factor
         
-        if exp_use_smart and st.session_state[exp_scale_track] != exp_scale_factor and exp_method_key not in ("hybrid", "graph_first", "dinov2_knn"):
+        if exp_use_smart and st.session_state[exp_scale_track] != exp_scale_factor and exp_method_key not in ("hybrid", "graph_first"):
             st.session_state[exp_scale_track] = exp_scale_factor
             # Pre-set widget keys to new display values (before widgets are created)
             prefixes = {"superpixel": "exp_sp_", "adaptive": "exp_ad_", "graph": "exp_gr_"}
@@ -2152,16 +1972,7 @@ else:
             with st.expander("⚙️ Advanced", expanded=False):
                 exp_allow_ow_g = st.checkbox("Overwrite", value=False, key="exp_allow_ow_g",
                     help="When ON, later rounds can overwrite earlier labels if the new round has higher confidence. Leave OFF unless you see obvious mislabeling.")
-                exp_g_min_votes = st.slider("Min votes per segment", 1, 10, 2, 1,
-                    key="exp_gr_min_votes",
-                    help="Minimum annotation points per segment to assign a label. "
-                         "1 = original behaviour. 2+ = requires stronger evidence. Default 2.")
-                exp_g_majority = st.slider("Majority fraction", 0.0, 1.0, 0.0, 0.1,
-                    key="exp_gr_majority",
-                    help="Minimum fraction of votes the winning class must have. "
-                         "0 = no requirement. 0.6 = 60%% must agree. Default 0.")
-            seg_params = {'scales': exp_scale_values, 'allow_overwrite': exp_allow_ow_g,
-                          'min_votes': exp_g_min_votes, 'majority_fraction': exp_g_majority}
+            seg_params = {'scales': exp_scale_values, 'allow_overwrite': exp_allow_ow_g}
         
         elif seg_method == "🔀 Hybrid (SLIC + Graph)":
             st.caption("**S** = Superpixel (count), **G** = Graph (threshold)")
@@ -2217,23 +2028,13 @@ else:
             with st.expander("⚙️ Advanced", expanded=False):
                 exp_h_allow_ow = st.checkbox("Overwrite", value=False, key="exp_hybrid_ow",
                     help="When ON, later rounds can overwrite earlier labels if the new round has higher confidence. Leave OFF unless you see obvious mislabeling.")
-                exp_h_min_votes = st.slider("Min votes per segment", 1, 10, 2, 1,
-                    key="exp_hybrid_min_votes",
-                    help="Minimum annotation points per segment to assign a label. "
-                         "2+ = requires agreement. Default 2.")
-                exp_h_majority = st.slider("Majority fraction", 0.0, 1.0, 0.0, 0.1,
-                    key="exp_hybrid_majority",
-                    help="Minimum fraction of votes the winning class must have. "
-                         "0 = no requirement. 0.6 = 60%% must agree. Default 0.")
             
             seg_params = {
                 'round_configs': exp_round_configs,
-                'allow_overwrite': exp_h_allow_ow,
-                'min_votes': exp_h_min_votes,
-                'majority_fraction': exp_h_majority
+                'allow_overwrite': exp_h_allow_ow
             }
         
-        elif seg_method == "🔍 Graph-First (Anchor + Fill)":
+        else:  # Graph-First (Anchor + Fill)
             st.markdown("**Phase 1: Discovery**")
             exp_gf_discovery_scale = st.select_slider(
                 "Discovery scale",
@@ -2282,57 +2083,12 @@ else:
                 exp_gf_allow_ow = st.checkbox("Allow fill to overwrite anchors", value=False, key="exp_gf_ow",
                     help="When OFF (default), fill-in rounds only label pixels the discovery round left unlabeled. "
                          "When ON, fill-in rounds can overwrite discovery labels.")
-                exp_gf_min_votes = st.slider("Min votes per segment", 1, 10, 2, 1,
-                    key="exp_gf_min_votes",
-                    help="Minimum annotation points per segment to assign a label. "
-                         "1 = original behaviour. 2+ = requires stronger evidence. Default 2.")
-                exp_gf_majority = st.slider("Majority fraction", 0.0, 1.0, 0.0, 0.1,
-                    key="exp_gf_majority",
-                    help="Minimum fraction of votes the winning class must have. "
-                         "0 = no requirement. 0.6 = 60%% must agree. Default 0.")
             
             seg_params = {
                 'discovery_scale': exp_gf_discovery_scale,
                 'fill_method': 'superpixel' if exp_gf_fill_method == 'Superpixel' else 'graph',
                 'fill_values': exp_gf_fill_values,
-                'allow_overwrite': exp_gf_allow_ow,
-                'min_votes': exp_gf_min_votes,
-                'majority_fraction': exp_gf_majority
-            }
-        
-        elif seg_method == "🤖 DINOv2 + KNN":
-            st.caption("K controls how many neighboring pixels influence each prediction")
-            exp_k_value = st.slider("K neighbors", 1, 20, 5, 1,
-                key="exp_k",
-                help="Number of nearest neighbors to consider when propagating labels. "
-                     "Lower values (1-3) create more precise, local predictions. "
-                     "Higher values (10-20) create smoother, more robust results but may blur boundaries. "
-                     "Default 5 is a good balance. Changing K is instant after initial feature extraction.")
-            exp_mode_filter_value = st.select_slider("Mode filter size", options=[1, 3, 5, 7, 9, 11], value=5,
-                key="exp_mode_filter",
-                help="Kernel size for the majority-vote smoothing filter applied to patch labels before upsampling. "
-                     "Each patch label is replaced by the most common label in its NxN neighbourhood. "
-                     "Larger values produce fewer, more coherent segments but may over-smooth small features. "
-                     "Set to 1 to disable filtering (raw per-patch KNN output). Default 5 is a good balance.")
-            with st.expander("⚙️ Confidence & Segment Control", expanded=True):
-                exp_dino_conf = st.slider("KNN confidence threshold", 0.0, 1.0, 0.6, 0.05,
-                    key="exp_dino_conf",
-                    help="Minimum KNN probability for a patch to keep its label. "
-                         "Patches below this are set to background. "
-                         "0 = keep everything. 0.6 = moderate. 0.8+ = strict.")
-                exp_dino_min_patch = st.slider("Min patch region size", 1, 10, 2, 1,
-                    key="exp_dino_min_patch",
-                    help="Minimum contiguous patches for a region to survive. "
-                         "1 = keep everything. 2-3 = remove isolated patches. Default 2.")
-                exp_dino_max_seg = st.slider("Max segments", 0, 200, 50, 5,
-                    key="exp_dino_max_seg",
-                    help="Maximum segments in the final output. Smallest are removed to meet this cap. "
-                         "0 = no cap. 50 = good default for Roboflow.")
-            seg_params = {
-                'k': exp_k_value, 'mode_filter_size': exp_mode_filter_value,
-                'confidence_threshold': exp_dino_conf,
-                'min_patch_region': exp_dino_min_patch,
-                'max_segments': exp_dino_max_seg
+                'allow_overwrite': exp_gf_allow_ow
             }
         
         # Region merging (graph/hybrid/graph_first only)
@@ -2404,16 +2160,6 @@ else:
             exp_conf_threshold = 0
             st.caption("Confidence filtering is OFF (faster). Turn it on to filter uncertain regions; it will add noticeable processing time.")
         
-        # COCO export minimum component area
-        exp_min_component_area = st.slider(
-            "Min export component area (px)", 10, 1000, 200, 10,
-            key="exp_min_component_area",
-            help="Minimum pixel area for a connected component to be included in the COCO export. "
-                 "Components smaller than this are silently skipped during export. "
-                 "This is the final safety net to prevent tiny, useless annotations from reaching Roboflow. "
-                 "10 = original behaviour (almost nothing filtered). 200 = moderate. 500+ = strict."
-        )
-        
         # Export settings button
         if seg_method == "🔀 Hybrid (SLIC + Graph)":
             exp_hybrid_scale_values = [f"{c['type'][0].upper()}:{c['value']}" for c in exp_round_configs]
@@ -2421,8 +2167,6 @@ else:
         elif seg_method == "🔍 Graph-First (Anchor + Fill)":
             exp_gf_display_values = [f"D:{seg_params['discovery_scale']}"] + [f"F:{v}" for v in seg_params['fill_values']]
             exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, exp_num_rounds, exp_gf_display_values, seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled, exp_merge_params)
-        elif seg_method == "🤖 DINOv2 + KNN":
-            exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, 1, [f"K:{seg_params['k']}"], seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled, None, mode_filter_size=seg_params.get('mode_filter_size', 3))
         else:
             exp_settings_txt = format_settings_txt(seg_method, exp_scale_factor, exp_num_rounds, exp_scale_values, seg_params, exp_use_smart, exp_conf_threshold, exp_conf_enabled, exp_merge_params)
         st.download_button(
@@ -2476,26 +2220,13 @@ else:
                     elif seg_method == "📊 Graph-based (Felzenszwalb)":
                         final_mask, _ = multi_scale_graph_labeling(
                             scaled_image, scaled_points, st.session_state.labelset, seg_params['scales'],
-                            allow_overwrite=seg_params.get('allow_overwrite', False),
-                            min_votes=seg_params.get('min_votes', 1),
-                            majority_fraction=seg_params.get('majority_fraction', 0.0)
+                            allow_overwrite=seg_params.get('allow_overwrite', False)
                         )
                     elif seg_method == "🔀 Hybrid (SLIC + Graph)":
                         final_mask, _ = multi_scale_hybrid_labeling(
                             scaled_image, scaled_points, st.session_state.labelset,
                             seg_params['round_configs'],
-                            allow_overwrite=seg_params.get('allow_overwrite', False),
-                            min_votes=seg_params.get('min_votes', 1),
-                            majority_fraction=seg_params.get('majority_fraction', 0.0)
-                        )
-                    elif seg_method == "🤖 DINOv2 + KNN":
-                        final_mask, _ = multi_scale_dinov2_knn_labeling(
-                            scaled_image, scaled_points, st.session_state.labelset,
-                            k=seg_params['k'],
-                            mode_filter_size=seg_params.get('mode_filter_size', 3),
-                            confidence_threshold=seg_params.get('confidence_threshold', 0.0),
-                            min_patch_region=seg_params.get('min_patch_region', 2),
-                            max_segments=seg_params.get('max_segments', 50)
+                            allow_overwrite=seg_params.get('allow_overwrite', False)
                         )
                     else:  # Graph-First
                         final_mask, _ = multi_scale_graph_first_labeling(
@@ -2503,9 +2234,7 @@ else:
                             discovery_scale=seg_params['discovery_scale'],
                             fill_method=seg_params['fill_method'],
                             fill_values=seg_params['fill_values'],
-                            allow_overwrite=seg_params.get('allow_overwrite', False),
-                            min_votes=seg_params.get('min_votes', 1),
-                            majority_fraction=seg_params.get('majority_fraction', 0.0)
+                            allow_overwrite=seg_params.get('allow_overwrite', False)
                         )
                     
                     # Apply region merging for graph/hybrid/graph_first methods
@@ -2537,8 +2266,7 @@ else:
         if st.session_state.processed:
             st.markdown(f"**{len(st.session_state.processed)} images** processed")
             
-            coco_dict = export_to_coco_dict(st.session_state.processed, st.session_state.labelset,
-                                            min_component_area=st.session_state.get('exp_min_component_area', 200))
+            coco_dict = export_to_coco_dict(st.session_state.processed, st.session_state.labelset)
             coco_json = json.dumps(coco_dict, indent=2)
             
             st.download_button(
@@ -2605,3 +2333,172 @@ else:
                     st.dataframe(_pd.DataFrame(seg_rows), use_container_width=True, hide_index=True)
                 
                 st.caption("Each 'segment' is a separate connected-component instance that Roboflow will see as an individual annotation.")
+
+# (COCO Viewer moved to standalone coco_viewer.py)
+if False:
+
+    st.subheader("🗂️ COCO Viewer — Inspect segmentation regions from a COCO JSON file")
+
+    # --- File selection ---
+    output_dir = os.path.join(os.path.dirname(__file__), 'output')
+    json_files = sorted([f for f in os.listdir(output_dir) if f.endswith('.json')]) if os.path.isdir(output_dir) else []
+
+    col_sel, col_up = st.columns([2, 1])
+    with col_sel:
+        selected_json = st.selectbox(
+            "Select COCO JSON from output/",
+            options=["— select —"] + json_files,
+            help="Pick a COCO JSON file generated by the batch export pipeline."
+        )
+    with col_up:
+        uploaded_json = st.file_uploader("Or upload a COCO JSON", type=['json'], key='coco_viewer_upload')
+
+    if uploaded_json is not None:
+        coco_viewer_data = json.loads(uploaded_json.read())
+    elif selected_json and selected_json != "— select —":
+        with open(os.path.join(output_dir, selected_json), 'r') as _f:
+            coco_viewer_data = json.load(_f)
+    else:
+        st.info("Select a COCO JSON file above to begin.")
+        st.stop()
+
+    # --- Parse COCO ---
+    coco_images = {img['id']: img for img in coco_viewer_data.get('images', [])}
+    coco_cats = {cat['id']: cat['name'] for cat in coco_viewer_data.get('categories', [])}
+    coco_anns_by_image = {}
+    for ann in coco_viewer_data.get('annotations', []):
+        coco_anns_by_image.setdefault(ann['image_id'], []).append(ann)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Images", len(coco_images))
+    c2.metric("Annotations", f"{len(coco_viewer_data.get('annotations', [])):,}")
+    c3.metric("Classes", len(coco_cats))
+
+    with st.expander("📊 Class distribution", expanded=False):
+        from collections import Counter as _Counter
+        cat_counts = _Counter(ann['category_id'] for ann in coco_viewer_data.get('annotations', []))
+        dist_rows = sorted([{'Class': coco_cats.get(k, str(k)), 'Annotations': v}
+                            for k, v in cat_counts.items()], key=lambda x: -x['Annotations'])
+        st.dataframe(pd.DataFrame(dist_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # --- Build image path index (recursive scan of input/images and colab_images) ---
+    @st.cache_data(show_spinner=False)
+    def build_image_index(base_dirs):
+        index = {}
+        exts = {'.jpg', '.jpeg', '.png', '.bmp', '.JPG', '.JPEG', '.PNG', '.BMP'}
+        for base in base_dirs:
+            if not os.path.isdir(base):
+                continue
+            for root, _dirs, files in os.walk(base):
+                for fname in files:
+                    if os.path.splitext(fname)[1] in exts:
+                        index[fname] = os.path.join(root, fname)
+                        index[normalize_image_name(fname)] = os.path.join(root, fname)
+        return index
+
+    _base = os.path.dirname(__file__)
+    _image_index = build_image_index((
+        os.path.normpath(os.path.join(_base, '..', 'input', 'images')),
+        os.path.join(_base, 'output', 'colab_images'),
+    ))
+
+    def find_coco_image(fname):
+        return _image_index.get(fname) or _image_index.get(normalize_image_name(fname))
+
+    # --- Consistent color per category ---
+    import hashlib as _hs
+    def cat_color(cat_id):
+        h = int(_hs.md5(str(cat_id).encode()).hexdigest()[:6], 16)
+        return (max((h >> 16) & 0xFF, 80), max((h >> 8) & 0xFF, 80), max(h & 0xFF, 80))
+
+    def draw_coco_masks(img_bgr, annotations, alpha=0.55):
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+        overlay = img_rgb.copy()
+        label_pos = []
+        for ann in annotations:
+            color = cat_color(ann['category_id'])
+            for poly in ann.get('segmentation', []):
+                if len(poly) < 6:
+                    continue
+                pts = np.array(poly, dtype=np.float32).reshape(-1, 2).astype(np.int32)
+                cv2.fillPoly(overlay, [pts], color)
+                cv2.polylines(overlay, [pts], True, (255, 255, 255), 1)
+                cx, cy = pts.mean(axis=0).astype(int)
+                label_pos.append((int(cx), int(cy), coco_cats.get(ann['category_id'], '?')))
+        result = cv2.addWeighted(img_rgb, 1 - alpha, overlay, alpha, 0).astype(np.uint8)
+        for cx, cy, label in label_pos:
+            cv2.putText(result, label, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(result, label, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 1, cv2.LINE_AA)
+        return result
+
+    # --- Random sample grid ---
+    st.subheader("🎲 Random Sample")
+    col_n, col_btn = st.columns([2, 1])
+    with col_n:
+        n_sample = st.slider("Images to show", 2, 12, 6, key='coco_n_sample')
+    with col_btn:
+        if st.button("🔀 New random sample", use_container_width=True):
+            import random as _r
+            st.session_state.coco_sample_seed = _r.randint(0, 99999)
+
+    if 'coco_sample_seed' not in st.session_state:
+        import random as _r
+        st.session_state.coco_sample_seed = _r.randint(0, 99999)
+
+    import random as _rand
+    _rand.seed(st.session_state.coco_sample_seed)
+    all_img_ids = list(coco_images.keys())
+    sample_ids = _rand.sample(all_img_ids, min(n_sample, len(all_img_ids)))
+
+    for row_ids in [sample_ids[i:i+3] for i in range(0, len(sample_ids), 3)]:
+        cols = st.columns(3)
+        for col, img_id in zip(cols, row_ids):
+            img_info = coco_images[img_id]
+            fname = img_info['file_name']
+            img_path = find_coco_image(fname)
+            with col:
+                if img_path and os.path.exists(img_path):
+                    img_bgr = cv2.imread(img_path)
+                    if img_bgr is not None:
+                        anns = coco_anns_by_image.get(img_id, [])
+                        st.image(draw_coco_masks(img_bgr, anns),
+                                 caption=f"{fname}  •  {len(anns)} ann.",
+                                 use_container_width=True)
+                    else:
+                        st.warning(f"Can't read: {fname}")
+                else:
+                    st.caption(f"📁 {fname}")
+                    st.warning("Image not found locally")
+
+    # --- Detail view ---
+    st.markdown("---")
+    st.subheader("🔍 Detail View — select a specific image")
+
+    img_names_list = [coco_images[i]['file_name'] for i in all_img_ids]
+    selected_fname = st.selectbox("Select image", img_names_list, key='coco_detail_select')
+    selected_id = next(i for i, img in coco_images.items() if img['file_name'] == selected_fname)
+    detail_anns = coco_anns_by_image.get(selected_id, [])
+
+    img_path = find_coco_image(selected_fname)
+    if img_path and os.path.exists(img_path):
+        img_bgr = cv2.imread(img_path)
+        if img_bgr is not None:
+            col_orig2, col_mask2 = st.columns(2)
+            with col_orig2:
+                st.markdown("**Original**")
+                st.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
+            with col_mask2:
+                st.markdown(f"**Segmentation — {len(detail_anns)} annotations**")
+                st.image(draw_coco_masks(img_bgr, detail_anns, alpha=0.6), use_container_width=True)
+            with st.expander("📋 Annotation details", expanded=False):
+                ann_rows = [{'Class': coco_cats.get(a['category_id'], '?'),
+                             'Area': f"{a.get('area', 0):.0f}",
+                             'Polygon points': sum(len(p) // 2 for p in a.get('segmentation', []))}
+                            for a in detail_anns]
+                if ann_rows:
+                    st.dataframe(pd.DataFrame(ann_rows), use_container_width=True, hide_index=True)
+    else:
+        st.warning(f"Image file not found locally: `{selected_fname}`  \n"
+                   f"Make sure images are in `input/images/` or `output/colab_images/`.")

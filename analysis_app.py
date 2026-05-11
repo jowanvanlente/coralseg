@@ -239,30 +239,38 @@ with tab_img:
     st.markdown("---")
     st.subheader("Outlier images (point count out of range)")
 
+    use_range = st.checkbox("Filter by point count range", value=True)
     col_min, col_max = st.columns(2)
     min_pts = col_min.number_input(
         "Minimum points (inclusive)", min_value=0, value=50, step=10,
         help="Images with fewer than this many points are flagged as outliers.",
+        disabled=not use_range,
     )
     max_pts = col_max.number_input(
         "Maximum points (inclusive)", min_value=0, value=150, step=10,
         help="Images with more than this many points are flagged as outliers.",
+        disabled=not use_range,
     )
 
+    use_name = st.checkbox("Filter by filename", value=True)
     exclude_str = st.text_input(
         "Exclude images whose filename contains (case-insensitive)",
         value="trainingMM",
         help="Any image whose normalised name contains this substring will be removed from the cleaned CSV.",
+        disabled=not use_name,
     )
 
     pts_per_img = df.groupby("NameNorm").size().reset_index(name="Points")
-    outliers = pts_per_img[
-        (pts_per_img["Points"] < min_pts) | (pts_per_img["Points"] > max_pts)
-    ].sort_values("Points", ascending=False).reset_index(drop=True)
+    if use_range:
+        outliers = pts_per_img[
+            (pts_per_img["Points"] < min_pts) | (pts_per_img["Points"] > max_pts)
+        ].sort_values("Points", ascending=False).reset_index(drop=True)
+    else:
+        outliers = pts_per_img.iloc[0:0]  # empty
 
     # Images excluded by the name-substring filter
     exclude_lower = exclude_str.strip().lower()
-    if exclude_lower:
+    if use_name and exclude_lower:
         string_excluded = [n for n in df["NameNorm"].unique() if exclude_lower in n.lower()]
     else:
         string_excluded = []
@@ -278,6 +286,7 @@ with tab_img:
 
         # Build cleaned dataframe: remove both outlier and string-excluded images
         all_excluded = set(outliers["NameNorm"]) | set(string_excluded)
+        st.info(f"**Total excluded:** {len(all_excluded)} images  →  **{total_images_csv - len(all_excluded)}** images included")
         clean_df = df[~df["NameNorm"].isin(all_excluded)].drop(columns=["NameNorm"])
         if "Label code" not in clean_df.columns and "Label" in clean_df.columns:
             clean_df = clean_df.rename(columns={"Label": "Label code"})

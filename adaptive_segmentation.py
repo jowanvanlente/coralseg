@@ -7,6 +7,7 @@ import cv2
 from scipy import ndimage as ndi
 from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
+from utils import label_segments_from_points
 
 
 def create_adaptive_segments(image, points_df, min_distance=10, density_threshold=5):
@@ -38,40 +39,6 @@ def create_adaptive_segments(image, points_df, min_distance=10, density_threshol
     markers[tuple(local_max.T)] = np.arange(1, len(local_max) + 1)
     segments = watershed(-distance, markers, mask=np.ones_like(distance, dtype=bool))
     return segments
-
-
-def label_segments_from_points(segments, points_df, labelset, return_confidence=False):
-    """Label segments based on sparse point annotations."""
-    label_to_id = {entry['Short Code']: int(entry['Count']) for entry in labelset}
-    labeled_mask = np.zeros(segments.shape, dtype=np.uint8)
-    segment_votes = {}
-    
-    for _, row in points_df.iterrows():
-        col = int(row['Column'])
-        row_y = int(row['Row'])
-        label_name = row['Label']
-        if label_name not in label_to_id:
-            continue
-        class_id = label_to_id[label_name]
-        if 0 <= row_y < segments.shape[0] and 0 <= col < segments.shape[1]:
-            segment_id = segments[row_y, col]
-            if segment_id not in segment_votes:
-                segment_votes[segment_id] = {}
-            if class_id not in segment_votes[segment_id]:
-                segment_votes[segment_id][class_id] = 0
-            segment_votes[segment_id][class_id] += 1
-    
-    confidence_map = np.zeros(segments.shape, dtype=np.uint8)
-    for segment_id, votes in segment_votes.items():
-        if votes:
-            winning_class = max(votes.items(), key=lambda x: x[1])[0]
-            total_votes = sum(votes.values())
-            labeled_mask[segments == segment_id] = winning_class
-            confidence_map[segments == segment_id] = min(total_votes, 255)
-    
-    if return_confidence:
-        return labeled_mask, confidence_map
-    return labeled_mask
 
 
 def multi_scale_adaptive_labeling(image, points_df, labelset, scales=[1.0, 0.5, 0.25], 
