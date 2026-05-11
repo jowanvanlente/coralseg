@@ -1,14 +1,12 @@
-"""
-CoralSeg Annotation Analysis Dashboard
+"""CoralSeg Annotation Analysis Dashboard
 --------------------------------------
-Standalone Streamlit app for inspecting the point annotations used to train
-the patch-classifier / SegFormer model.
+Combined analysis of CoralNet point annotations (CSV) and Roboflow
+polygon annotations (COCO JSON) for training-data class-imbalance inspection.
 
 Run:
     streamlit run analysis_app.py --server.port 8502
 """
 
-import os
 import json
 from pathlib import Path
 
@@ -19,13 +17,14 @@ from PIL import Image, ImageDraw
 
 from utils import (
     load_labelset_from_json,
-    load_annotations_from_df,
+    load_coco_annotations,
     normalize_image_name,
 )
 
 # ---------- defaults ----------
 ROOT = Path(__file__).parent
-DEFAULT_CSV = ROOT / "input" / "annotations" / "annotations_confirmed.csv"
+DEFAULT_CSV = ROOT / "input" / "annotations" / "annotations_confirmed_merged.csv"
+DEFAULT_COCO = ROOT / "input" / "annotations" / "Roboflow" / "20260508_annotations.coco.json"
 DEFAULT_IMG_DIR = ROOT / "input" / "images" / "Training Data"
 LABELSET_PATH = ROOT / "input" / "labelset" / "labelset.json"
 
@@ -47,7 +46,7 @@ st.markdown(
 
 st.title("CoralSeg – Annotation Analysis")
 st.caption(
-    "Dashboard for the point annotations used to train the patch-classifier / SegFormer model."
+    "Combined dashboard: CoralNet point annotations + Roboflow polygon annotations."
 )
 
 
@@ -58,11 +57,10 @@ def load_labelset():
         return load_labelset_from_json(json.load(f))
 
 
-@st.cache_data(show_spinner="Loading annotations CSV…")
+@st.cache_data(show_spinner="Loading CoralNet CSV…")
 def load_csv(csv_path: str) -> pd.DataFrame:
     """Load CSV, normalise image names, keep useful columns."""
     df = pd.read_csv(csv_path, low_memory=False)
-    # Normalise label column (CSV uses 'Label code')
     if "Label" not in df.columns and "Label code" in df.columns:
         df = df.rename(columns={"Label code": "Label"})
     needed = ["Name", "Row", "Column", "Label"]
@@ -73,6 +71,12 @@ def load_csv(csv_path: str) -> pd.DataFrame:
     df["NameNorm"] = df["Name"].astype(str).map(normalize_image_name)
     df["Label"] = df["Label"].astype(str)
     return df
+
+
+@st.cache_data(show_spinner="Loading Roboflow COCO…")
+def load_coco(coco_path: str) -> pd.DataFrame:
+    """Load COCO JSON into a flat DataFrame with NameNorm, Label, Area."""
+    return load_coco_annotations(coco_path)
 
 
 @st.cache_data(show_spinner="Indexing image folder…")
@@ -90,29 +94,53 @@ def index_images(img_dir: str) -> dict:
 
 
 @st.cache_data(show_spinner=False)
-def build_class_table(df: pd.DataFrame, _labelset: list) -> pd.DataFrame:
-    """Per-class point count, image count, plus labelset metadata."""
-    by_label = df.groupby("Label")
-    rows = []
-    n_total_imgs = df["NameNorm"].nunique()
+def build_class_table(
+    df_coralnet: pd.DataFrame,
+    df_roboflow: pd.DataFrame,
+    _labelset: list,
+) -> pd.DataFrame:
+    """Per-class stats combining CoralNet points and Roboflow polygons."""
     meta_by_code = {e["Short Code"]: e for e in _labelset}
-    for code, g in by_label:
-        meta = meta_by_code.get(code, {})
-        n_points = len(g)
-        n_images = g["NameNorm"].nunique()
-        rows.append(
-            {
-                "Short Code": code,
-                "Name": meta.get("Name", code),
-                "Functional Group": meta.get("Functional Group", "Unknown"),
-                "Points": n_points,
-                "Images": n_images,
-                "% of points": 100 * n_points / len(df),
-                "% of images": 100 * n_images / n_total_imgs,
-                "Color": meta.get("Color Code", [128, 128, 128]),
+
+    # CoralNet aggregation
+    cn_by_label = df_coralnet.groupby("Label")
+    cn_stats = {}
+    for code, g in cn_by_label:
+        cn_stats[code] = {"cn_points": len(g), "cn_images": g["NameNorm"].nunique()}
+
+    # Roboflow aggregation
+    rf_stats = {}
+    if len(df_roboflow):
+        rf_by_label = df_roboflow.groupby("Label")
+        for code, g in rf_by_label:
+            rf_stats[code] = {
+                "rf_instances": len(g),
+                "rf_images": g["NameNorm"].nunique(),
+                "rf_area": int(g["Area"].sum()),
             }
-        )
-    out = pd.DataFrame(rows).sort_values("Points", ascending=False).reset_index(drop=True)
+
+    all_codes = sorted(set(cn_stats) | set(rf_stats))
+    total_cn = len(df_coralnet)
+    total_rf = len(df_roboflow)
+    rows = []
+    for code in all_codes:
+        meta = meta_by_code.get(code, {})
+        cn = cn_stats.get(code, {"cn_points": 0, "cn_images": 0})
+        rf = rf_stats.get(code, {"rf_instances": 0, "rf_images": 0, "rf_area": 0})
+        rows.append({
+            "Short Code": code,
+            "Name": meta.get("Name", code),
+            "Functional Group": meta.get("Functional Group", "Unknown"),
+            "CN Points": cn["cn_points"],
+            "CN Images": cn["cn_images"],
+            "RF Instances": rf["rf_instances"],
+            "RF Images": rf["rf_images"],
+            "RF Area (px)": rf["rf_area"],
+            "% CN pts": 100 * cn["cn_points"] / max(total_cn, 1),
+            "% RF inst": 100 * rf["rf_instances"] / max(total_rf, 1),
+            "Color": meta.get("Color Code", [128, 128, 128]),
+        })
+    out = pd.DataFrame(rows).sort_values("CN Points", ascending=False).reset_index(drop=True)
     return out
 
 
@@ -124,7 +152,8 @@ def color_to_hex(c):
 
 # ---------- sidebar ----------
 st.sidebar.header("Data sources")
-csv_path = st.sidebar.text_input("Annotations CSV", str(DEFAULT_CSV))
+csv_path = st.sidebar.text_input("CoralNet CSV", str(DEFAULT_CSV))
+coco_path = st.sidebar.text_input("Roboflow COCO JSON", str(DEFAULT_COCO))
 img_dir = st.sidebar.text_input("Image folder (recursive)", str(DEFAULT_IMG_DIR))
 
 if not Path(csv_path).exists():
@@ -135,22 +164,41 @@ labelset = load_labelset()
 df = load_csv(csv_path)
 img_index = index_images(img_dir)
 
+# Load Roboflow COCO (empty DF if file missing)
+if Path(coco_path).exists():
+    df_rf = load_coco(coco_path)
+else:
+    st.sidebar.warning("COCO JSON not found – showing CoralNet only.")
+    df_rf = pd.DataFrame(columns=["NameNorm", "Label", "Area", "ImgW", "ImgH"])
+
 color_by_code = {e["Short Code"]: color_to_hex(e.get("Color Code", [128, 128, 128])) for e in labelset}
 
 # Top-level metrics
-total_points = len(df)
-total_images_csv = df["NameNorm"].nunique()
-total_classes = df["Label"].nunique()
-matched_imgs = sum(1 for n in df["NameNorm"].unique() if n in img_index)
+total_cn_points = len(df)
+total_cn_images = df["NameNorm"].nunique()
+total_rf_instances = len(df_rf)
+total_rf_images = df_rf["NameNorm"].nunique() if len(df_rf) else 0
+all_images = set(df["NameNorm"].unique())
+if len(df_rf):
+    all_images |= set(df_rf["NameNorm"].unique())
+overlap_images = set(df["NameNorm"].unique()) & set(df_rf["NameNorm"].unique()) if len(df_rf) else set()
+total_classes = len(set(df["Label"].unique()) | (set(df_rf["Label"].unique()) if len(df_rf) else set()))
+matched_imgs = sum(1 for n in all_images if n in img_index)
 
-c1, c2, c3, c4 = st.sidebar.columns(2) if False else (st.sidebar, None, None, None)
 st.sidebar.markdown("---")
-st.sidebar.metric("Total points", f"{total_points:,}")
-st.sidebar.metric("Images in CSV", f"{total_images_csv:,}")
-st.sidebar.metric("Images on disk (matched)", f"{matched_imgs:,} / {total_images_csv:,}")
-st.sidebar.metric("Classes", total_classes)
+st.sidebar.markdown("**CoralNet (point annotations)**")
+st.sidebar.metric("Points", f"{total_cn_points:,}")
+st.sidebar.metric("Images", f"{total_cn_images:,}")
+st.sidebar.markdown("**Roboflow (polygon annotations)**")
+st.sidebar.metric("Polygon instances", f"{total_rf_instances:,}")
+st.sidebar.metric("Images", f"{total_rf_images:,}")
+st.sidebar.markdown("---")
+st.sidebar.metric("Unique images (union)", f"{len(all_images):,}")
+st.sidebar.metric("Images in both sources", f"{len(overlap_images):,}")
+st.sidebar.metric("Images on disk", f"{matched_imgs:,}")
+st.sidebar.metric("Total classes", total_classes)
 
-class_table = build_class_table(df, labelset)
+class_table = build_class_table(df, df_rf, labelset)
 
 # ---------- tabs ----------
 tab_img, tab_classes, tab_imbalance, tab_explorer = st.tabs(
@@ -162,9 +210,10 @@ with tab_img:
     st.subheader("Inspect a single image")
 
     only_matched = st.checkbox("Only show images present on disk", value=True)
-    names = sorted(df["NameNorm"].unique())
+    # Union of images from both sources
+    all_img_names = sorted(set(df["NameNorm"].unique()) | (set(df_rf["NameNorm"].unique()) if len(df_rf) else set()))
     if only_matched:
-        names = [n for n in names if n in img_index]
+        all_img_names = [n for n in all_img_names if n in img_index]
 
     query = st.text_input(
         "Search filename", "", key="img_search",
@@ -172,9 +221,9 @@ with tab_img:
     )
     if query:
         q = query.lower()
-        filtered = [n for n in names if q in n.lower()]
+        filtered = [n for n in all_img_names if q in n.lower()]
     else:
-        filtered = names
+        filtered = all_img_names
 
     if not filtered:
         st.warning(
@@ -182,9 +231,10 @@ with tab_img:
         )
     else:
         sel = st.selectbox(
-            f"Image ({len(filtered):,} of {len(names):,} shown)", filtered
+            f"Image ({len(filtered):,} of {len(all_img_names):,} shown)", filtered
         )
-        sub = df[df["NameNorm"] == sel]
+        sub_cn = df[df["NameNorm"] == sel]
+        sub_rf = df_rf[df_rf["NameNorm"] == sel] if len(df_rf) else df_rf.iloc[0:0]
 
         col_img, col_info = st.columns([3, 2])
 
@@ -195,49 +245,73 @@ with tab_img:
             else:
                 img = Image.open(path).convert("RGB")
                 draw = ImageDraw.Draw(img)
-                # Radius scales with image size
                 r = max(4, min(img.size) // 200)
-                for _, row in sub.iterrows():
+                for _, row in sub_cn.iterrows():
                     x, y = int(row["Column"]), int(row["Row"])
                     fill = color_by_code.get(row["Label"], "#ff00ff")
                     draw.ellipse((x - r, y - r, x + r, y + r), fill=fill, outline="black")
-                st.image(img, caption=f"{sel}  ({len(sub)} points)", use_container_width=True)
+                caption_parts = []
+                if len(sub_cn):
+                    caption_parts.append(f"{len(sub_cn)} CoralNet points")
+                if len(sub_rf):
+                    caption_parts.append(f"{len(sub_rf)} Roboflow polygons")
+                st.image(img, caption=f"{sel}  ({', '.join(caption_parts) or 'no annotations'})", use_container_width=True)
 
         with col_info:
-            st.markdown(f"**Points in this image:** {len(sub)}")
-            freq = (
-                sub.groupby("Label")
-                .size()
-                .reset_index(name="Points")
-                .sort_values("Points", ascending=False)
-            )
             meta_by_code = {e["Short Code"]: e for e in labelset}
-            freq["Name"] = freq["Label"].map(lambda c: meta_by_code.get(c, {}).get("Name", c))
-            freq["Functional Group"] = freq["Label"].map(
-                lambda c: meta_by_code.get(c, {}).get("Functional Group", "")
-            )
-            freq["Color"] = freq["Label"].map(lambda c: color_by_code.get(c, "#808080"))
 
-            # Render a small HTML table with color swatches
-            html = ["<table style='width:100%;font-size:0.85rem;border-collapse:collapse;'>"]
-            html.append(
-                "<tr><th></th><th align='left'>Code</th><th align='left'>Name</th>"
-                "<th align='left'>Group</th><th align='right'>Points</th></tr>"
-            )
-            for _, r_ in freq.iterrows():
-                html.append(
-                    f"<tr style='border-top:1px solid #eee;'>"
-                    f"<td><span style='display:inline-block;width:14px;height:14px;"
-                    f"background:{r_['Color']};border:1px solid #555;border-radius:3px;'></span></td>"
-                    f"<td>{r_['Label']}</td><td>{r_['Name']}</td>"
-                    f"<td>{r_['Functional Group']}</td><td align='right'>{r_['Points']}</td></tr>"
+            # CoralNet annotations table
+            if len(sub_cn):
+                st.markdown(f"**CoralNet points:** {len(sub_cn)}")
+                freq = (
+                    sub_cn.groupby("Label").size().reset_index(name="Points")
+                    .sort_values("Points", ascending=False)
                 )
-            html.append("</table>")
-            st.markdown("".join(html), unsafe_allow_html=True)
+                freq["Name"] = freq["Label"].map(lambda c: meta_by_code.get(c, {}).get("Name", c))
+                freq["Color"] = freq["Label"].map(lambda c: color_by_code.get(c, "#808080"))
+                html = ["<table style='width:100%;font-size:0.85rem;border-collapse:collapse;'>"]
+                html.append("<tr><th></th><th align='left'>Code</th><th align='left'>Name</th><th align='right'>Pts</th></tr>")
+                for _, r_ in freq.iterrows():
+                    html.append(
+                        f"<tr style='border-top:1px solid #eee;'>"
+                        f"<td><span style='display:inline-block;width:14px;height:14px;"
+                        f"background:{r_['Color']};border:1px solid #555;border-radius:3px;'></span></td>"
+                        f"<td>{r_['Label']}</td><td>{r_['Name']}</td><td align='right'>{r_['Points']}</td></tr>"
+                    )
+                html.append("</table>")
+                st.markdown("".join(html), unsafe_allow_html=True)
+            else:
+                st.info("No CoralNet annotations for this image.")
 
-    # ---- Outlier detection ----
+            # Roboflow annotations table
+            if len(sub_rf):
+                st.markdown(f"**Roboflow polygons:** {len(sub_rf)}")
+                rf_freq = (
+                    sub_rf.groupby("Label").agg(Instances=("Label", "size"), Area=("Area", "sum"))
+                    .reset_index().sort_values("Area", ascending=False)
+                )
+                rf_freq["Name"] = rf_freq["Label"].map(lambda c: meta_by_code.get(c, {}).get("Name", c))
+                rf_freq["Color"] = rf_freq["Label"].map(lambda c: color_by_code.get(c, "#808080"))
+                html = ["<table style='width:100%;font-size:0.85rem;border-collapse:collapse;'>"]
+                html.append("<tr><th></th><th align='left'>Code</th><th align='left'>Name</th>"
+                            "<th align='right'>Inst</th><th align='right'>Area (px)</th></tr>")
+                for _, r_ in rf_freq.iterrows():
+                    html.append(
+                        f"<tr style='border-top:1px solid #eee;'>"
+                        f"<td><span style='display:inline-block;width:14px;height:14px;"
+                        f"background:{r_['Color']};border:1px solid #555;border-radius:3px;'></span></td>"
+                        f"<td>{r_['Label']}</td><td>{r_['Name']}</td>"
+                        f"<td align='right'>{int(r_['Instances'])}</td>"
+                        f"<td align='right'>{int(r_['Area']):,}</td></tr>"
+                    )
+                html.append("</table>")
+                st.markdown("".join(html), unsafe_allow_html=True)
+            else:
+                st.info("No Roboflow annotations for this image.")
+
+    # ---- Outlier detection (CoralNet only) ----
     st.markdown("---")
-    st.subheader("Outlier images (point count out of range)")
+    st.subheader("Outlier images (CoralNet point count)")
 
     use_range = st.checkbox("Filter by point count range", value=True)
     col_min, col_max = st.columns(2)
@@ -266,9 +340,8 @@ with tab_img:
             (pts_per_img["Points"] < min_pts) | (pts_per_img["Points"] > max_pts)
         ].sort_values("Points", ascending=False).reset_index(drop=True)
     else:
-        outliers = pts_per_img.iloc[0:0]  # empty
+        outliers = pts_per_img.iloc[0:0]
 
-    # Images excluded by the name-substring filter
     exclude_lower = exclude_str.strip().lower()
     if use_name and exclude_lower:
         string_excluded = [n for n in df["NameNorm"].unique() if exclude_lower in n.lower()]
@@ -276,17 +349,16 @@ with tab_img:
         string_excluded = []
 
     if outliers.empty and not string_excluded:
-        st.success(f"No outliers found (range: {min_pts}–{max_pts} points, inclusive) and no name-match exclusions.")
+        st.success(f"No outliers (range {min_pts}–{max_pts}) and no name-match exclusions.")
     else:
         if not outliers.empty:
             st.warning(f"{len(outliers)} image(s) outside the {min_pts}–{max_pts} range.")
-            st.dataframe(outliers.rename(columns={"NameNorm": "Image"}), use_container_width=True, hide_index=True)
+            st.dataframe(outliers.rename(columns={"NameNorm": "Image"}), width="stretch", hide_index=True)
         if string_excluded:
             st.warning(f"{len(string_excluded)} image(s) excluded by name filter '{exclude_str}'.")
 
-        # Build cleaned dataframe: remove both outlier and string-excluded images
         all_excluded = set(outliers["NameNorm"]) | set(string_excluded)
-        st.info(f"**Total excluded:** {len(all_excluded)} images  →  **{total_images_csv - len(all_excluded)}** images included")
+        st.info(f"**Total excluded:** {len(all_excluded)} images  →  **{total_cn_images - len(all_excluded)}** images remain")
         clean_df = df[~df["NameNorm"].isin(all_excluded)].drop(columns=["NameNorm"])
         if "Label code" not in clean_df.columns and "Label" in clean_df.columns:
             clean_df = clean_df.rename(columns={"Label": "Label code"})
@@ -297,12 +369,12 @@ with tab_img:
             try:
                 clean_df.to_csv(CLEANED_PATH, index=False)
                 st.success(
-                    f"✅ Saved **{len(clean_df):,}** rows to `{CLEANED_PATH}`  \n"
+                    f"Saved **{len(clean_df):,}** rows to `{CLEANED_PATH}`  \n"
                     f"Removed: **{len(outliers)}** point-count outlier(s), "
                     f"**{len(string_excluded)}** name-filter exclusion(s)."
                 )
             except Exception as e:
-                st.error(f"❌ Could not save file: {e}")
+                st.error(f"Could not save file: {e}")
 
         st.download_button(
             "⬇️ Download list of excluded filenames",
@@ -314,17 +386,18 @@ with tab_img:
 
 # ============== TAB 2: class overview ==============
 with tab_classes:
-    st.subheader("Per-class statistics")
+    st.subheader("Per-class statistics (combined)")
     show = class_table.copy()
     show["Color"] = show["Color"].map(color_to_hex)
 
-    # Custom HTML table so we can render the colour swatch
-    html = ["<table style='width:100%;font-size:0.85rem;border-collapse:collapse;'>"]
+    html = ["<table style='width:100%;font-size:0.82rem;border-collapse:collapse;'>"]
     html.append(
         "<tr style='text-align:left;border-bottom:2px solid #999;'>"
         "<th></th><th>Code</th><th>Name</th><th>Group</th>"
-        "<th align='right'>Points</th><th align='right'>Images</th>"
-        "<th align='right'>% pts</th><th align='right'>% imgs</th></tr>"
+        "<th align='right'>CN Pts</th><th align='right'>CN Imgs</th>"
+        "<th align='right'>RF Inst</th><th align='right'>RF Imgs</th>"
+        "<th align='right'>RF Area</th>"
+        "<th align='right'>% CN</th><th align='right'>% RF</th></tr>"
     )
     for _, r_ in show.iterrows():
         html.append(
@@ -333,16 +406,33 @@ with tab_classes:
             f"background:{r_['Color']};border:1px solid #555;border-radius:3px;'></span></td>"
             f"<td>{r_['Short Code']}</td><td>{r_['Name']}</td>"
             f"<td>{r_['Functional Group']}</td>"
-            f"<td align='right'>{r_['Points']:,}</td>"
-            f"<td align='right'>{r_['Images']:,}</td>"
-            f"<td align='right'>{r_['% of points']:.2f}</td>"
-            f"<td align='right'>{r_['% of images']:.2f}</td></tr>"
+            f"<td align='right'>{int(r_['CN Points']):,}</td>"
+            f"<td align='right'>{int(r_['CN Images']):,}</td>"
+            f"<td align='right'>{int(r_['RF Instances']):,}</td>"
+            f"<td align='right'>{int(r_['RF Images']):,}</td>"
+            f"<td align='right'>{int(r_['RF Area (px)']):,}</td>"
+            f"<td align='right'>{r_['% CN pts']:.2f}</td>"
+            f"<td align='right'>{r_['% RF inst']:.2f}</td></tr>"
         )
     html.append("</table>")
     st.markdown("".join(html), unsafe_allow_html=True)
 
+    st.caption("CN = CoralNet point annotations · RF = Roboflow polygon annotations · Area in pixels²")
+
     csv_bytes = class_table.drop(columns=["Color"]).to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Download class table (CSV)", csv_bytes, "class_table.csv", "text/csv")
+
+    # Classes only in one source
+    cn_only = class_table[(class_table["CN Points"] > 0) & (class_table["RF Instances"] == 0)]
+    rf_only = class_table[(class_table["CN Points"] == 0) & (class_table["RF Instances"] > 0)]
+    if len(cn_only) or len(rf_only):
+        with st.expander("Classes present in only one source"):
+            if len(cn_only):
+                st.markdown(f"**CoralNet only** ({len(cn_only)} classes): "
+                            + ", ".join(cn_only["Short Code"].tolist()))
+            if len(rf_only):
+                st.markdown(f"**Roboflow only** ({len(rf_only)} classes): "
+                            + ", ".join(rf_only["Short Code"].tolist()))
 
 
 # ============== TAB 3: class imbalance ==============
@@ -351,35 +441,48 @@ with tab_imbalance:
 
     metric = st.radio(
         "Metric",
-        ["Points", "Images"],
+        ["CN Points", "RF Instances", "RF Area (px)", "CN Images", "RF Images"],
         horizontal=True,
-        help="Points = number of point annotations per class. "
-        "Images = number of distinct images that contain at least one point of that class.",
+        help="CN Points = CoralNet point count · RF Instances = Roboflow polygon count · "
+             "RF Area = total polygon area in px² · Images = distinct images with at least one annotation.",
     )
 
-    order = class_table.sort_values(metric, ascending=False).reset_index(drop=True)
-    vals = order[metric].astype(int)
+    order = class_table[class_table[metric] > 0].sort_values(metric, ascending=False).reset_index(drop=True)
+    vals = order[metric].astype(float)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Classes", len(order))
-    c2.metric(f"Total {metric.lower()}", f"{vals.sum():,}")
-    c3.metric("Median per class", f"{int(vals.median()):,}")
+    c2.metric(f"Total", f"{int(vals.sum()):,}")
+    c3.metric("Median", f"{int(vals.median()):,}" if len(vals) else "—")
     c4.metric(
-        "Max / Min ratio",
-        f"{(vals.max() / max(vals.min(), 1)):.0f}×",
-        help="Largest class divided by smallest class (rough imbalance indicator).",
+        "Max / Min",
+        f"{(vals.max() / max(vals.min(), 1)):.0f}×" if len(vals) else "—",
+        help="Largest / smallest class (rough imbalance indicator).",
     )
 
-    # Bar chart: most_common -> least_common
-    chart_df = order[["Short Code", metric]].set_index("Short Code")
-    st.bar_chart(chart_df, height=420)
+    chart_df = order[["Short Code", metric]].reset_index(drop=True)
+    st.bar_chart(chart_df, x="Short Code", y=metric, height=420)
+
+    # Side-by-side comparison: CoralNet vs Roboflow distribution
+    if len(df_rf):
+        st.markdown("---")
+        st.markdown("**Distribution comparison (% of total per source)**")
+        compare = class_table[["Short Code", "% CN pts", "% RF inst"]].copy()
+        compare = compare[(compare["% CN pts"] > 0) | (compare["% RF inst"] > 0)]
+        compare = compare.sort_values("% CN pts", ascending=False).reset_index(drop=True)
+        compare = compare.rename(columns={"% CN pts": "CoralNet %", "% RF inst": "Roboflow %"})
+        st.bar_chart(compare, x="Short Code", y=["CoralNet %", "Roboflow %"], height=420)
+
+        st.caption("This chart shows whether Roboflow annotations reinforce or counteract "
+                   "the CoralNet class imbalance. Classes where the blue bar exceeds orange "
+                   "are over-represented in CoralNet relative to Roboflow.")
 
     with st.expander("Table sorted by selected metric"):
         st.dataframe(
-            order[
-                ["Short Code", "Name", "Functional Group", "Points", "Images", "% of points", "% of images"]
-            ],
-            use_container_width=True,
+            order[["Short Code", "Name", "Functional Group",
+                   "CN Points", "CN Images", "RF Instances", "RF Images",
+                   "RF Area (px)", "% CN pts", "% RF inst"]],
+            width="stretch",
             hide_index=True,
         )
 
@@ -391,7 +494,8 @@ with tab_explorer:
     all_options = class_table["Short Code"].tolist()
     all_labels = [
         f"{c}  –  {class_table.loc[class_table['Short Code'] == c, 'Name'].iloc[0]}  "
-        f"({int(class_table.loc[class_table['Short Code'] == c, 'Images'].iloc[0])} imgs)"
+        f"(CN:{int(class_table.loc[class_table['Short Code'] == c, 'CN Points'].iloc[0])}"
+        f" RF:{int(class_table.loc[class_table['Short Code'] == c, 'RF Instances'].iloc[0])})"
         for c in all_options
     ]
 
@@ -401,7 +505,6 @@ with tab_explorer:
     )
     if query:
         q = query.lower()
-        # Match against the short code, full name and functional group
         pairs = [
             (code, lbl)
             for code, lbl in zip(all_options, all_labels)
@@ -427,27 +530,45 @@ with tab_explorer:
     )
     sel_code = options[idx]
 
-    sub = df[df["Label"] == sel_code]
-    img_counts = (
-        sub.groupby("NameNorm").size().reset_index(name="Points of this class").sort_values(
-            "Points of this class", ascending=False
-        )
+    # CoralNet images
+    sub_cn = df[df["Label"] == sel_code]
+    cn_img_counts = (
+        sub_cn.groupby("NameNorm").size().reset_index(name="CN Points")
+        .sort_values("CN Points", ascending=False)
     )
-    img_counts["On disk"] = img_counts["NameNorm"].map(lambda n: "✓" if n in img_index else "—")
 
+    # Roboflow images
+    sub_rf = df_rf[df_rf["Label"] == sel_code] if len(df_rf) else df_rf.iloc[0:0]
+    rf_img_counts = (
+        sub_rf.groupby("NameNorm").agg(
+            **{"RF Instances": ("Label", "size"), "RF Area": ("Area", "sum")}
+        ).reset_index().sort_values("RF Instances", ascending=False)
+    ) if len(sub_rf) else pd.DataFrame(columns=["NameNorm", "RF Instances", "RF Area"])
+
+    # Merge both
+    merged = cn_img_counts.merge(rf_img_counts, on="NameNorm", how="outer")
+    merged = merged.infer_objects(copy=False).fillna(0)
+    merged["CN Points"] = merged["CN Points"].astype(int)
+    merged["RF Instances"] = merged["RF Instances"].astype(int)
+    merged["RF Area"] = merged["RF Area"].astype(int)
+    merged["On disk"] = merged["NameNorm"].map(lambda n: "✓" if n in img_index else "—")
+    merged = merged.sort_values("CN Points", ascending=False).reset_index(drop=True)
+
+    total_cn = int(merged["CN Points"].sum())
+    total_rf = int(merged["RF Instances"].sum())
     st.markdown(
-        f"**{sel_code}** appears in **{len(img_counts):,}** images "
-        f"with **{len(sub):,}** total points."
+        f"**{sel_code}** — {len(merged):,} images · "
+        f"{total_cn:,} CoralNet points · {total_rf:,} Roboflow polygons"
     )
 
     st.dataframe(
-        img_counts.rename(columns={"NameNorm": "Image"}),
-        use_container_width=True,
+        merged.rename(columns={"NameNorm": "Image"}),
+        width="stretch",
         hide_index=True,
         height=500,
     )
 
-    csv_bytes = img_counts.to_csv(index=False).encode("utf-8")
+    csv_bytes = merged.to_csv(index=False).encode("utf-8")
     st.download_button(
         f"⬇️ Download image list for {sel_code}",
         csv_bytes,

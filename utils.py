@@ -2,6 +2,7 @@
 Utility functions for loading data and image operations.
 """
 
+import re
 import numpy as np
 import pandas as pd
 import cv2
@@ -27,6 +28,87 @@ def normalize_image_name(name):
             name = base[:-len(ext)] + ext
     
     return name
+
+
+# --------------- Roboflow COCO helpers ---------------
+
+# Maps Roboflow COCO category names → CoralNet short codes
+_ROBOFLOW_NAME_TO_SHORT_CODE = {
+    "Acanthastrea": "Aca", "Acropora": "Acr", "Astrea": "Astrea",
+    "Astreopora": "Astreo", "Coscinaraea": "Cos", "Cyphastrea": "Cyph",
+    "Diploastrea": "Diplo", "Dipsastraea": "Dipsa", "Duncanopsammia": "Dun",
+    "Echinopora": "Echpo", "Favites": "Favit", "Fungiidae": "Fungii",
+    "Galaxea": "Gal", "Gardineroseris": "Gar", "Goniastrea": "Gonia",
+    "Goniopora": "Gonio", "Hydnophora": "Hydno", "Isopora": "Iso",
+    "Leptastrea": "Lepta", "Leptoria": "Leptor", "Leptoseris": "Leptos",
+    "Lobophyllia": "Lobophyl", "Merulina": "Mer", "Millepora": "Mil",
+    "Montipora": "Monti", "Paramontastea": "Para", "Pavona": "Pav",
+    "Physogyra": "Phy", "Platygyra": "Platy", "Pocillopora": "Poc",
+    "Porites branching": "PorB", "Porites massive": "PorM",
+    "Psammocora": "Psa", "Seriatopora": "Ser", "Stylophora": "Styl",
+    "Turbinaria": "Turb-HC",
+}
+
+
+def _demangle_roboflow_name(extra_name: str) -> str:
+    """Recover original filename from Roboflow's extra.name field.
+
+    Roboflow replaces the original extension '.' with '-', then appends
+    a new extension.  e.g. 'image.JPG' → 'image-JPG.JPG'.
+    """
+    base, ext = os.path.splitext(extra_name)
+    m = re.match(
+        r"^(.*)-(" + "|".join(["jpg", "jpeg", "png", "tif", "tiff", "bmp"]) + r")$",
+        base,
+        re.IGNORECASE,
+    )
+    if m:
+        return m.group(1) + "." + m.group(2)
+    return extra_name
+
+
+def load_coco_annotations(coco_path: str) -> pd.DataFrame:
+    """Load a Roboflow COCO-JSON export into a flat DataFrame.
+
+    Returns a DataFrame with columns:
+        NameNorm  – normalised original image filename
+        Label     – CoralNet short code
+        Area      – polygon area in pixels²
+        ImgW, ImgH – image dimensions (needed for area-% calc)
+    Categories not in the mapping (e.g. the root 'REEFo') are skipped.
+    """
+    with open(coco_path, "r") as f:
+        coco = json.load(f)
+
+    cat_map = {c["id"]: c["name"] for c in coco["categories"]}
+    img_map = {}
+    for im in coco["images"]:
+        extra_name = im.get("extra", {}).get("name", im["file_name"])
+        original = _demangle_roboflow_name(extra_name)
+        img_map[im["id"]] = {
+            "NameNorm": normalize_image_name(original),
+            "ImgW": im["width"],
+            "ImgH": im["height"],
+        }
+
+    rows = []
+    for ann in coco["annotations"]:
+        cat_name = cat_map.get(ann["category_id"], "")
+        short_code = _ROBOFLOW_NAME_TO_SHORT_CODE.get(cat_name)
+        if short_code is None:
+            continue  # skip root / unmapped categories
+        im_info = img_map.get(ann["image_id"])
+        if im_info is None:
+            continue
+        rows.append({
+            "NameNorm": im_info["NameNorm"],
+            "Label": short_code,
+            "Area": ann.get("area", 0),
+            "ImgW": im_info["ImgW"],
+            "ImgH": im_info["ImgH"],
+        })
+
+    return pd.DataFrame(rows)
 
 
 LABEL_META_BY_SHORT_CODE = {
