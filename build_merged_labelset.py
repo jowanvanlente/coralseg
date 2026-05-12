@@ -9,8 +9,8 @@ then run this script:
 
 Outputs:
     input/labelset/labelset_merged.json
-    input/annotations/annotations_cleaned_merged.csv
     input/annotations/annotations_confirmed_merged.csv
+    input/annotations/Roboflow/<name>_merged.coco.json
 
 Prints a before/after summary so you can sanity check the result.
 """
@@ -31,10 +31,10 @@ import class_merge_config as cfg  # noqa: E402
 
 LABELSET_IN = ROOT / "input" / "labelset" / "labelset.json"
 LABELSET_OUT = ROOT / "input" / "labelset" / "labelset_merged.json"
-CLEANED_IN = ROOT / "input" / "annotations" / "annotations_cleaned.csv"
-CLEANED_OUT = ROOT / "input" / "annotations" / "annotations_cleaned_merged.csv"
 CONFIRMED_IN = ROOT / "input" / "annotations" / "annotations_confirmed.csv"
 CONFIRMED_OUT = ROOT / "input" / "annotations" / "annotations_confirmed_merged.csv"
+
+COCO_DIR = ROOT / "input" / "annotations" / "Roboflow"
 
 
 def resolve_target(code: str, merge_map: dict, drop_codes: set,
@@ -126,6 +126,71 @@ def print_summary(name: str, before: pd.Series, after: pd.Series) -> None:
         print(f"    {code:<14} {n}")
 
 
+def remap_coco(coco_path: Path, output_path: Path, resolution: dict,
+               roboflow_to_short: dict) -> None:
+    """Remap a Roboflow COCO JSON to the merged class structure.
+
+    - Categories are replaced with one entry per surviving merged short code.
+    - Annotations whose class is dropped are removed.
+    - Annotations whose class is merged get their category_id updated.
+    """
+    raw = json.loads(coco_path.read_text(encoding="utf-8"))
+
+    # old category id → merged short code (None = drop)
+    old_to_merged: dict[int, str | None] = {}
+    for cat in raw["categories"]:
+        short = roboflow_to_short.get(cat["name"])
+        if short is None:
+            continue  # root / unmapped (e.g. "REEFo")
+        old_to_merged[cat["id"]] = resolution.get(short)
+
+    # Build new category list (sorted unique merged targets)
+    unique_targets = sorted({t for t in old_to_merged.values() if t is not None})
+    new_cat_by_code = {
+        code: {"id": i, "name": code, "supercategory": "none"}
+        for i, code in enumerate(unique_targets, start=1)
+    }
+
+    # Remap annotations
+    new_annotations = []
+    dropped = 0
+    for ann in raw["annotations"]:
+        merged = old_to_merged.get(ann["category_id"])
+        if merged is None:
+            dropped += 1
+            continue
+        new_ann = dict(ann)
+        new_ann["category_id"] = new_cat_by_code[merged]["id"]
+        new_annotations.append(new_ann)
+
+    out = {
+        "info": raw.get("info", {}),
+        "licenses": raw.get("licenses", []),
+        "categories": list(new_cat_by_code.values()),
+        "images": raw["images"],
+        "annotations": new_annotations,
+    }
+    output_path.write_text(json.dumps(out), encoding="utf-8")
+
+    print(f"\nWrote {output_path}")
+    print(f"  Categories: {len(raw['categories'])} -> {len(new_cat_by_code)}")
+    print(f"  Annotations: {len(raw['annotations'])} -> {len(new_annotations)} "
+          f"(dropped {dropped})")
+    # Show which old categories merged
+    merge_report: dict[str, list[str]] = {}
+    for cat in raw["categories"]:
+        short = roboflow_to_short.get(cat["name"])
+        if short is None:
+            continue
+        target = resolution.get(short)
+        if target and target != short:
+            merge_report.setdefault(target, []).append(f"{cat['name']}({short})")
+    if merge_report:
+        print("  Merged categories:")
+        for tgt, srcs in sorted(merge_report.items()):
+            print(f"    {tgt} <- {', '.join(srcs)}")
+
+
 def main() -> None:
     print(f"Reading labelset: {LABELSET_IN}")
     original = json.loads(LABELSET_IN.read_text(encoding="utf-8"))
@@ -154,14 +219,6 @@ def main() -> None:
     LABELSET_OUT.write_text(json.dumps(merged, indent=4), encoding="utf-8")
     print(f"Wrote {LABELSET_OUT} ({len(merged)} classes)")
 
-    # ---- annotations_cleaned ----
-    print(f"\nReading {CLEANED_IN}")
-    cleaned = pd.read_csv(CLEANED_IN)
-    cleaned_out = remap_label_codes(cleaned, resolution)
-    cleaned_out.to_csv(CLEANED_OUT, index=False)
-    print(f"Wrote {CLEANED_OUT}")
-    print_summary("annotations_cleaned", cleaned["Label code"], cleaned_out["Label code"])
-
     # ---- annotations_confirmed ----
     print(f"\nReading {CONFIRMED_IN}")
     confirmed = pd.read_csv(CONFIRMED_IN, low_memory=False)
@@ -178,6 +235,23 @@ def main() -> None:
         tgt = changed[src]
         arrow = "DROP" if tgt is None else f"-> {tgt}"
         print(f"  {src:<14} {arrow}")
+
+    # ---- Roboflow COCO JSON(s) ----
+    from utils import _ROBOFLOW_NAME_TO_SHORT_CODE
+
+    if COCO_DIR.is_dir():
+        coco_files = sorted(COCO_DIR.glob("*.coco.json"))
+        # Skip already-merged files
+        coco_files = [f for f in coco_files if "_merged" not in f.stem]
+        if not coco_files:
+            print(f"\nNo *.coco.json files found in {COCO_DIR} — skipping COCO merge.")
+        for coco_in in coco_files:
+            coco_out = coco_in.with_name(
+                coco_in.name.replace(".coco.json", "_merged.coco.json")
+            )
+            remap_coco(coco_in, coco_out, resolution, _ROBOFLOW_NAME_TO_SHORT_CODE)
+    else:
+        print(f"\n{COCO_DIR} does not exist — skipping COCO merge.")
 
 
 if __name__ == "__main__":

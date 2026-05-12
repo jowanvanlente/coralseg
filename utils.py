@@ -96,7 +96,11 @@ def load_coco_annotations(coco_path: str) -> pd.DataFrame:
         cat_name = cat_map.get(ann["category_id"], "")
         short_code = _ROBOFLOW_NAME_TO_SHORT_CODE.get(cat_name)
         if short_code is None:
-            continue  # skip root / unmapped categories
+            # Merged COCO files use short codes as category names directly
+            if cat_name in LABEL_META_BY_SHORT_CODE:
+                short_code = cat_name
+            else:
+                continue  # skip root / unmapped categories
         im_info = img_map.get(ann["image_id"])
         if im_info is None:
             continue
@@ -206,6 +210,7 @@ LABEL_META_BY_SHORT_CODE = {
     'Turb-BA': {'Name': 'Turbinaria (algae)', 'Functional Group': 'Algae'},
     'Val': {'Name': 'Valonia spp.', 'Functional Group': 'Algae'},
     'SG': {'Name': 'Seagrass', 'Functional Group': 'Seagrass'},
+    'Other': {'Name': 'Other invertebrates', 'Functional Group': 'Other Invertebrates'},
 }
 
 

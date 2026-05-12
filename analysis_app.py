@@ -8,6 +8,7 @@ Run:
 """
 
 import json
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -19,14 +20,17 @@ from utils import (
     load_labelset_from_json,
     load_coco_annotations,
     normalize_image_name,
+    _demangle_roboflow_name,
+    _ROBOFLOW_NAME_TO_SHORT_CODE,
+    LABEL_META_BY_SHORT_CODE,
 )
 
 # ---------- defaults ----------
 ROOT = Path(__file__).parent
 DEFAULT_CSV = ROOT / "input" / "annotations" / "annotations_confirmed_merged.csv"
-DEFAULT_COCO = ROOT / "input" / "annotations" / "Roboflow" / "20260508_annotations.coco.json"
+DEFAULT_COCO = ROOT / "input" / "annotations" / "Roboflow" / "20260508_annotations_merged.coco.json"
 DEFAULT_IMG_DIR = ROOT / "input" / "images" / "Training Data"
-LABELSET_PATH = ROOT / "input" / "labelset" / "labelset.json"
+LABELSET_PATH = ROOT / "input" / "labelset" / "labelset_merged.json"
 
 st.set_page_config(page_title="CoralSeg Annotation Analysis", layout="wide")
 
@@ -77,6 +81,13 @@ def load_csv(csv_path: str) -> pd.DataFrame:
 def load_coco(coco_path: str) -> pd.DataFrame:
     """Load COCO JSON into a flat DataFrame with NameNorm, Label, Area."""
     return load_coco_annotations(coco_path)
+
+
+@st.cache_data(show_spinner="Loading raw COCO JSON…")
+def load_coco_raw(coco_path: str) -> dict:
+    """Load the raw COCO JSON dict for validation inspection."""
+    with open(coco_path, "r") as f:
+        return json.load(f)
 
 
 @st.cache_data(show_spinner="Indexing image folder…")
@@ -171,6 +182,34 @@ else:
     st.sidebar.warning("COCO JSON not found – showing CoralNet only.")
     df_rf = pd.DataFrame(columns=["NameNorm", "Label", "Area", "ImgW", "ImgH"])
 
+# Build raw COCO index for polygon rendering (shared by image viewer and validation tab)
+coco_raw = None
+coco_cat_map: dict = {}
+coco_img_meta: dict = {}
+coco_anns_by_img: dict = {}
+if Path(coco_path).exists():
+    coco_raw = load_coco_raw(coco_path)
+    coco_cat_map = {c["id"]: c["name"] for c in coco_raw["categories"]}
+    for im in coco_raw["images"]:
+        extra_name = im.get("extra", {}).get("name", im["file_name"])
+        demangled = _demangle_roboflow_name(extra_name)
+        norm = normalize_image_name(demangled)
+        coco_img_meta[im["id"]] = {
+            "file_name": im["file_name"],
+            "extra_name": extra_name,
+            "demangled": demangled,
+            "norm": norm,
+            "width": im["width"],
+            "height": im["height"],
+            "tags": im.get("extra", {}).get("user_tags", []),
+        }
+    for a in coco_raw["annotations"]:
+        iid = a["image_id"]
+        if iid not in coco_img_meta:
+            continue
+        norm = coco_img_meta[iid]["norm"]
+        coco_anns_by_img.setdefault(norm, []).append(a)
+
 color_by_code = {e["Short Code"]: color_to_hex(e.get("Color Code", [128, 128, 128])) for e in labelset}
 
 # Top-level metrics
@@ -201,19 +240,29 @@ st.sidebar.metric("Total classes", total_classes)
 class_table = build_class_table(df, df_rf, labelset)
 
 # ---------- tabs ----------
-tab_img, tab_classes, tab_imbalance, tab_explorer = st.tabs(
-    ["🖼️ Image viewer", "📋 Class overview", "⚖️ Class imbalance", "🔎 Class explorer"]
+tab_img, tab_classes, tab_imbalance, tab_explorer, tab_validate = st.tabs(
+    ["🖼️ Image viewer", "📋 Class overview", "⚖️ Class imbalance",
+     "🔎 Class explorer", "🔬 Data validation"]
 )
 
 # ============== TAB 1: image viewer ==============
 with tab_img:
     st.subheader("Inspect a single image")
 
-    only_matched = st.checkbox("Only show images present on disk", value=True)
+    rf_images_set = set(df_rf["NameNorm"].unique()) if len(df_rf) else set()
+    col_f1, col_f2 = st.columns(2)
+    only_matched = col_f1.checkbox("Only show images present on disk", value=True)
+    only_has_roboflow = col_f2.checkbox(
+        "Only show images with Roboflow annotations",
+        value=False,
+        disabled=len(rf_images_set) == 0,
+    )
     # Union of images from both sources
-    all_img_names = sorted(set(df["NameNorm"].unique()) | (set(df_rf["NameNorm"].unique()) if len(df_rf) else set()))
+    all_img_names = sorted(set(df["NameNorm"].unique()) | rf_images_set)
     if only_matched:
         all_img_names = [n for n in all_img_names if n in img_index]
+    if only_has_roboflow:
+        all_img_names = [n for n in all_img_names if n in rf_images_set]
 
     query = st.text_input(
         "Search filename", "", key="img_search",
@@ -243,7 +292,50 @@ with tab_img:
             if path is None:
                 st.warning("Image file not found on disk.")
             else:
-                img = Image.open(path).convert("RGB")
+                img = Image.open(path).convert("RGBA")
+                # Draw Roboflow polygon overlays first (rendered behind CoralNet points)
+                rf_anns_for_img = coco_anns_by_img.get(sel, [])
+                if rf_anns_for_img:
+                    try:
+                        from pycocotools import mask as coco_mask_util
+                        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+                        draw_fill = ImageDraw.Draw(overlay)
+                        for ann in rf_anns_for_img:
+                            cat_name = coco_cat_map.get(ann["category_id"], "")
+                            sc = _ROBOFLOW_NAME_TO_SHORT_CODE.get(cat_name) or cat_name
+                            meta_entry = next((e for e in labelset if e["Short Code"] == sc), None)
+                            if meta_entry and "Color Code" in meta_entry:
+                                cc = meta_entry["Color Code"]
+                                rgb = (int(cc[0]), int(cc[1]), int(cc[2]))
+                            else:
+                                rgb = (255, 0, 255)
+                            fill_rgba = rgb + (60,)
+                            outline_rgba = rgb + (230,)
+                            seg = ann.get("segmentation")
+                            if isinstance(seg, list):
+                                for ring in seg:
+                                    if len(ring) >= 6:
+                                        pts = [(ring[i], ring[i + 1]) for i in range(0, len(ring), 2)]
+                                        draw_fill.polygon(pts, fill=fill_rgba)
+                                        draw_fill.line(pts + [pts[0]], fill=outline_rgba, width=3)
+                            elif isinstance(seg, dict):
+                                try:
+                                    if isinstance(seg["counts"], list):
+                                        rle = coco_mask_util.frPyObjects([seg], seg["size"][0], seg["size"][1])[0]
+                                    else:
+                                        rle = seg
+                                    mask_arr = coco_mask_util.decode(rle)
+                                    mask_img = Image.fromarray((mask_arr * 255).astype(np.uint8), mode="L")
+                                    color_layer = Image.new("RGBA", img.size, fill_rgba)
+                                    overlay.paste(color_layer, mask=mask_img)
+                                except Exception:
+                                    bx, by, bw, bh = ann.get("bbox", [0, 0, 0, 0])
+                                    draw_fill.rectangle([bx, by, bx + bw, by + bh], fill=fill_rgba, outline=outline_rgba)
+                        img = Image.alpha_composite(img, overlay)
+                    except ImportError:
+                        pass  # pycocotools not available
+                img = img.convert("RGB")
+                # Draw CoralNet points on top
                 draw = ImageDraw.Draw(img)
                 r = max(4, min(img.size) // 200)
                 for _, row in sub_cn.iterrows():
@@ -575,3 +667,468 @@ with tab_explorer:
         f"images_{sel_code}.csv",
         "text/csv",
     )
+
+
+# ============== TAB 5: data validation ==============
+with tab_validate:
+    st.subheader("Data Validation — CoralNet CSV vs Roboflow COCO")
+    st.caption("Critical audit of image matching, class mapping, and annotation integrity.")
+
+    coco_available = Path(coco_path).exists()
+    if not coco_available:
+        st.error("Roboflow COCO JSON not found — cannot run validation.")
+        st.stop()
+
+    csv_name_set = set(df["NameNorm"].unique())
+    csv_label_set = set(df["Label"].unique())
+
+    # ---- Section 0: Roboflow Polygon Viewer ----
+    st.markdown("---")
+    st.markdown("### 0. Roboflow Polygon Viewer")
+    st.markdown("Browse Roboflow-annotated images with polygon regions drawn. "
+                "Each class is shown in its own colour.")
+
+    # Image picker (all Roboflow images)
+    rf_img_norms = sorted(set(info["norm"] for info in coco_img_meta.values()))
+
+    rf_search = st.text_input(
+        "Search Roboflow image", "", key="rf_img_search",
+        placeholder="Filter by filename…",
+    )
+    if rf_search:
+        rf_filtered = [n for n in rf_img_norms if rf_search.lower() in n.lower()]
+    else:
+        rf_filtered = rf_img_norms
+
+    if not rf_filtered:
+        st.warning("No images match your filter.")
+    else:
+        rf_sel = st.selectbox(
+            f"Roboflow image ({len(rf_filtered):,} of {len(rf_img_norms):,})",
+            rf_filtered, key="rf_img_sel",
+        )
+
+        # Get annotations for this image
+        rf_anns = coco_anns_by_img.get(rf_sel, [])
+
+        col_rf_img, col_rf_info = st.columns([3, 2])
+
+        with col_rf_img:
+            path = img_index.get(rf_sel)
+            if path is None:
+                st.warning("Image file not found on disk — cannot render polygons.")
+            else:
+                from pycocotools import mask as coco_mask_util
+
+                img = Image.open(path).convert("RGBA")
+                overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+                draw_overlay = ImageDraw.Draw(overlay)
+                draw_outline = ImageDraw.Draw(img.convert("RGBA"))
+
+                # Re-compose: base + semi-transparent fills + outlines
+                base = img.copy()
+                overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+                draw_fill = ImageDraw.Draw(overlay)
+
+                for ann in rf_anns:
+                    cat_name = coco_cat_map.get(ann["category_id"], "")
+                    sc = _ROBOFLOW_NAME_TO_SHORT_CODE.get(cat_name) or cat_name
+                    # Get color
+                    meta_entry = next((e for e in labelset if e["Short Code"] == sc), None)
+                    if meta_entry and "Color Code" in meta_entry:
+                        c = meta_entry["Color Code"]
+                        rgb = (int(c[0]), int(c[1]), int(c[2]))
+                    else:
+                        rgb = (255, 0, 255)
+                    fill_rgba = rgb + (60,)
+                    outline_rgba = rgb + (220,)
+
+                    seg = ann.get("segmentation")
+                    if isinstance(seg, list):
+                        # Polygon format: list of [x1,y1,x2,y2,...] rings
+                        for ring in seg:
+                            if len(ring) >= 6:
+                                pts = [(ring[i], ring[i+1]) for i in range(0, len(ring), 2)]
+                                draw_fill.polygon(pts, fill=fill_rgba)
+                                draw_fill.polygon(pts, outline=outline_rgba)
+                    elif isinstance(seg, dict):
+                        # RLE format — decode to binary mask
+                        try:
+                            if isinstance(seg["counts"], list):
+                                rle = coco_mask_util.frPyObjects([seg], seg["size"][0], seg["size"][1])[0]
+                            else:
+                                rle = seg
+                            mask_arr = coco_mask_util.decode(rle)
+                            mask_img = Image.fromarray((mask_arr * 255).astype(np.uint8), mode="L")
+                            color_layer = Image.new("RGBA", base.size, fill_rgba)
+                            overlay.paste(color_layer, mask=mask_img)
+                        except Exception:
+                            # Fallback: draw bounding box
+                            bx, by, bw, bh = ann.get("bbox", [0, 0, 0, 0])
+                            draw_fill.rectangle(
+                                [bx, by, bx + bw, by + bh],
+                                fill=fill_rgba, outline=outline_rgba
+                            )
+
+                result = Image.alpha_composite(base, overlay).convert("RGB")
+                st.image(result, caption=f"{rf_sel} — {len(rf_anns)} annotation(s)",
+                         use_container_width=True)
+
+        with col_rf_info:
+            in_csv = rf_sel in csv_name_set
+            st.markdown(f"**Image:** `{rf_sel}`")
+            st.markdown(f"**In CoralNet CSV:** {'Yes' if in_csv else 'No'}")
+            st.markdown(f"**Annotations:** {len(rf_anns)}")
+
+            if rf_anns:
+                # Per-class breakdown
+                ann_classes = Counter()
+                ann_areas = {}
+                for ann in rf_anns:
+                    cat_name = coco_cat_map.get(ann["category_id"], "")
+                    sc = _ROBOFLOW_NAME_TO_SHORT_CODE.get(cat_name) or cat_name
+                    ann_classes[sc] += 1
+                    ann_areas[sc] = ann_areas.get(sc, 0) + ann.get("area", 0)
+
+                html = ["<table style='width:100%;font-size:0.85rem;border-collapse:collapse;'>"]
+                html.append("<tr><th></th><th>Code</th><th>Name</th>"
+                            "<th align='right'>Polygons</th><th align='right'>Area (px)</th></tr>")
+                for sc, cnt in ann_classes.most_common():
+                    color = color_by_code.get(sc, "#808080")
+                    meta = LABEL_META_BY_SHORT_CODE.get(sc, {})
+                    name = meta.get("Name", sc)
+                    area = int(ann_areas.get(sc, 0))
+                    html.append(
+                        f"<tr style='border-top:1px solid #eee;'>"
+                        f"<td><span style='display:inline-block;width:14px;height:14px;"
+                        f"background:{color};border:1px solid #555;border-radius:3px;'></span></td>"
+                        f"<td>{sc}</td><td>{name}</td>"
+                        f"<td align='right'>{cnt}</td>"
+                        f"<td align='right'>{area:,}</td></tr>"
+                    )
+                html.append("</table>")
+                st.markdown("".join(html), unsafe_allow_html=True)
+
+                # Segmentation type breakdown for this image
+                seg_counter = Counter()
+                for ann in rf_anns:
+                    s = ann.get("segmentation")
+                    seg_counter["Polygon" if isinstance(s, list) else "RLE"] += 1
+                st.caption(f"Seg types: {dict(seg_counter)}")
+
+    # ---- Section 1: Class Mapping ----
+    st.markdown("---")
+    st.markdown("### 1. COCO Category → Short Code Mapping")
+    st.markdown("Every Roboflow category must map to a CoralNet short code. "
+                "Flags: **UNMAPPED** = no mapping exists, **NOT IN CSV** = "
+                "short code valid but absent from CoralNet CSV (new class from biologist).")
+
+    map_rows = []
+    for cid, cname in sorted(coco_cat_map.items()):
+        sc = _ROBOFLOW_NAME_TO_SHORT_CODE.get(cname)
+        if sc is None and cname in LABEL_META_BY_SHORT_CODE:
+            sc = cname  # merged COCO: name is already the short code
+        meta = LABEL_META_BY_SHORT_CODE.get(sc, {}) if sc else {}
+        meta_name = meta.get("Name", "")
+        in_csv = sc in csv_label_set if sc else False
+        # count annotations for this category
+        ann_count = sum(1 for a in coco_raw["annotations"] if a["category_id"] == cid)
+        status = "OK"
+        if sc is None:
+            status = "UNMAPPED"
+        elif not in_csv:
+            status = "NOT IN CSV"
+        elif (meta_name and meta_name.lower() != cname.lower()
+              and cname != sc  # merged COCO uses short codes as names — no genus to compare
+              and not cname.startswith("Porites")):
+            status = f"NAME MISMATCH (meta: {meta_name})"
+        map_rows.append({
+            "COCO ID": cid,
+            "COCO Name": cname,
+            "Short Code": sc or "—",
+            "Labelset Name": meta_name or "—",
+            "In CSV": in_csv,
+            "RF Annotations": ann_count,
+            "Status": status,
+        })
+
+    map_df = pd.DataFrame(map_rows)
+    issues = map_df[map_df["Status"] != "OK"]
+    ok = map_df[map_df["Status"] == "OK"]
+
+    if len(issues):
+        st.warning(f"{len(issues)} category/ies flagged — review below.")
+        # Colour-coded HTML table
+        html = ["<table style='width:100%;font-size:0.85rem;border-collapse:collapse;'>"]
+        html.append("<tr style='border-bottom:2px solid #999;'>"
+                    "<th>ID</th><th>COCO Name</th><th>Short Code</th>"
+                    "<th>Labelset Name</th><th>In CSV</th><th>RF Anns</th><th>Status</th></tr>")
+        for _, r_ in map_df.iterrows():
+            bg = ""
+            if r_["Status"] == "UNMAPPED":
+                bg = "background:#ffe0e0;"
+            elif r_["Status"] == "NOT IN CSV":
+                bg = "background:#fff3cd;"
+            elif "MISMATCH" in r_["Status"]:
+                bg = "background:#ffe0cc;"
+            html.append(
+                f"<tr style='border-bottom:1px solid #eee;{bg}'>"
+                f"<td>{r_['COCO ID']}</td><td>{r_['COCO Name']}</td>"
+                f"<td><b>{r_['Short Code']}</b></td><td>{r_['Labelset Name']}</td>"
+                f"<td>{r_['In CSV']}</td><td align='right'>{r_['RF Annotations']}</td>"
+                f"<td><b>{r_['Status']}</b></td></tr>"
+            )
+        html.append("</table>")
+        st.markdown("".join(html), unsafe_allow_html=True)
+
+        st.markdown("**Legend:** "
+                    "<span style='background:#ffe0e0;padding:2px 6px;'>UNMAPPED</span> "
+                    "<span style='background:#fff3cd;padding:2px 6px;'>NOT IN CSV (new class)</span> "
+                    "<span style='background:#ffe0cc;padding:2px 6px;'>NAME MISMATCH</span>",
+                    unsafe_allow_html=True)
+    else:
+        st.success("All COCO categories map correctly to CoralNet short codes.")
+
+    with st.expander(f"All {len(ok)} OK mappings"):
+        st.dataframe(ok, width="stretch", hide_index=True)
+
+    # ---- Section 2: Image Name Matching ----
+    st.markdown("---")
+    st.markdown("### 2. Image Name Matching (Roboflow → CoralNet)")
+    st.markdown("Roboflow mangles filenames. We de-mangle via `extra.name` then normalize. "
+                "**Unmatched** = image in Roboflow but NOT in the CoralNet CSV.")
+
+    matched_imgs_list = []
+    unmatched_imgs_list = []
+    for iid, info in coco_img_meta.items():
+        entry = {
+            "COCO ID": iid,
+            "Roboflow file_name": info["file_name"],
+            "extra.name": info["extra_name"],
+            "De-mangled": info["demangled"],
+            "Normalized": info["norm"],
+            "W": info["width"],
+            "H": info["height"],
+            "Tags": ", ".join(info["tags"]) if info["tags"] else "",
+        }
+        if info["norm"] in csv_name_set:
+            matched_imgs_list.append(entry)
+        else:
+            unmatched_imgs_list.append(entry)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Matched", f"{len(matched_imgs_list):,}")
+    c2.metric("Unmatched", f"{len(unmatched_imgs_list):,}")
+    c3.metric("Match rate", f"{100 * len(matched_imgs_list) / max(len(coco_img_meta), 1):.1f}%")
+
+    if unmatched_imgs_list:
+        st.warning(f"{len(unmatched_imgs_list)} Roboflow images have NO match in the CoralNet CSV. "
+                   "These are likely new images annotated by the biologist.")
+        unmatched_df = pd.DataFrame(unmatched_imgs_list)
+
+        # Show prefix distribution
+        prefix_counts = Counter(r["Normalized"].split("_")[0] if "_" in r["Normalized"]
+                                else r["Normalized"][:6] for r in unmatched_imgs_list)
+        st.markdown("**Filename prefix distribution (unmatched):**")
+        prefix_str = " · ".join(f"`{k}` ({v})" for k, v in prefix_counts.most_common(15))
+        st.markdown(prefix_str)
+
+        # Count annotations lost
+        unmatched_ids = {r["COCO ID"] for r in unmatched_imgs_list}
+        lost_anns = sum(1 for a in coco_raw["annotations"] if a["image_id"] in unmatched_ids)
+        st.info(f"**{lost_anns:,}** polygon annotations sit on unmatched images "
+                f"({100 * lost_anns / max(len(coco_raw['annotations']), 1):.1f}% of total RF annotations).")
+
+        with st.expander(f"Full list of {len(unmatched_imgs_list)} unmatched images"):
+            st.dataframe(unmatched_df, width="stretch", hide_index=True, height=400)
+    else:
+        st.success("All Roboflow images match a CoralNet CSV image.")
+
+    with st.expander(f"Sample of {min(20, len(matched_imgs_list))} matched images (spot-check)"):
+        st.dataframe(pd.DataFrame(matched_imgs_list[:20]), width="stretch", hide_index=True)
+
+    # ---- Section 3: De-mangling audit ----
+    st.markdown("---")
+    st.markdown("### 3. Filename De-mangling Audit")
+    st.markdown("Show every image where de-mangling **changed** the name, so you can verify "
+                "the regex is correct.")
+
+    changed = [info for info in coco_img_meta.values()
+               if info["extra_name"] != info["demangled"]]
+    unchanged = [info for info in coco_img_meta.values()
+                 if info["extra_name"] == info["demangled"]]
+
+    c1, c2 = st.columns(2)
+    c1.metric("De-mangled (changed)", len(changed))
+    c2.metric("Unchanged", len(unchanged))
+
+    if changed:
+        demangle_df = pd.DataFrame([{
+            "extra.name": i["extra_name"],
+            "De-mangled": i["demangled"],
+            "Normalized": i["norm"],
+            "Matched CSV": i["norm"] in csv_name_set,
+        } for i in changed[:100]])
+        st.dataframe(demangle_df, width="stretch", hide_index=True, height=350)
+        if len(changed) > 100:
+            st.caption(f"Showing first 100 of {len(changed)} changed names.")
+
+    # ---- Section 4: Annotation integrity ----
+    st.markdown("---")
+    st.markdown("### 4. Annotation Integrity")
+
+    seg_types = Counter()
+    zero_area = 0
+    for a in coco_raw["annotations"]:
+        s = a.get("segmentation")
+        if isinstance(s, dict):
+            seg_types["RLE"] += 1
+        elif isinstance(s, list):
+            seg_types["Polygon"] += 1
+        else:
+            seg_types["Other"] += 1
+        if a.get("area", 0) == 0:
+            zero_area += 1
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total annotations", f"{len(coco_raw['annotations']):,}")
+    c2.metric("Polygon segmentations", seg_types.get("Polygon", 0))
+    c3.metric("RLE segmentations", seg_types.get("RLE", 0))
+    c4.metric("Area = 0", zero_area)
+
+    if zero_area:
+        st.warning(f"{zero_area} annotation(s) have area=0 — these are degenerate polygons.")
+    if seg_types.get("Other", 0):
+        st.error(f"{seg_types['Other']} annotation(s) have unknown segmentation format.")
+
+    # Images with no annotations
+    annotated_ids = set(a["image_id"] for a in coco_raw["annotations"])
+    no_ann = [coco_img_meta[iid] for iid in coco_img_meta if iid not in annotated_ids]
+    if no_ann:
+        st.warning(f"{len(no_ann)} COCO image(s) have **zero annotations**.")
+        st.dataframe(pd.DataFrame([{
+            "Normalized": i["norm"],
+            "extra.name": i["extra_name"],
+            "Tags": ", ".join(i["tags"]) if i["tags"] else "",
+        } for i in no_ann]), width="stretch", hide_index=True)
+
+    # Area distribution
+    areas = [a["area"] for a in coco_raw["annotations"] if a["area"] > 0]
+    if areas:
+        st.markdown("**Polygon area distribution (px²):**")
+        area_df = pd.DataFrame({"area": areas})
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Min", f"{min(areas):,.0f}")
+        c2.metric("Median", f"{np.median(areas):,.0f}")
+        c3.metric("Mean", f"{np.mean(areas):,.0f}")
+        c4.metric("Max", f"{max(areas):,.0f}")
+
+    # ---- Section 5: Roboflow-only vs CoralNet-only classes ----
+    st.markdown("---")
+    st.markdown("### 5. Class Coverage Comparison")
+
+    rf_codes_used = set()
+    for a in coco_raw["annotations"]:
+        cname = coco_cat_map.get(a["category_id"], "")
+        sc = _ROBOFLOW_NAME_TO_SHORT_CODE.get(cname)
+        if sc is None and cname in LABEL_META_BY_SHORT_CODE:
+            sc = cname
+        if sc:
+            rf_codes_used.add(sc)
+
+    both = csv_label_set & rf_codes_used
+    cn_only = csv_label_set - rf_codes_used
+    rf_only = rf_codes_used - csv_label_set
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("In both sources", len(both))
+    c2.metric("CoralNet only", len(cn_only))
+    c3.metric("Roboflow only", len(rf_only))
+
+    if rf_only:
+        st.info("**Roboflow-only classes** (annotated by biologist, absent from CoralNet CSV — "
+                "these are new training classes):")
+        rf_only_rows = []
+        for sc in sorted(rf_only):
+            meta = LABEL_META_BY_SHORT_CODE.get(sc, {})
+            count = sum(1 for a in coco_raw["annotations"]
+                        if (_ROBOFLOW_NAME_TO_SHORT_CODE.get(coco_cat_map.get(a["category_id"], ""))
+                    or coco_cat_map.get(a["category_id"], "")) == sc)
+            rf_only_rows.append({
+                "Short Code": sc,
+                "Name": meta.get("Name", sc),
+                "Functional Group": meta.get("Functional Group", "Unknown"),
+                "RF Annotations": count,
+            })
+        st.dataframe(pd.DataFrame(rf_only_rows), width="stretch", hide_index=True)
+
+    if cn_only:
+        with st.expander(f"CoralNet-only classes ({len(cn_only)} — no Roboflow polygons)"):
+            cn_only_rows = []
+            for sc in sorted(cn_only):
+                meta = LABEL_META_BY_SHORT_CODE.get(sc, {})
+                count = int(df[df["Label"] == sc].shape[0])
+                cn_only_rows.append({
+                    "Short Code": sc,
+                    "Name": meta.get("Name", sc),
+                    "Functional Group": meta.get("Functional Group", "Unknown"),
+                    "CN Points": count,
+                })
+            st.dataframe(pd.DataFrame(cn_only_rows), width="stretch", hide_index=True)
+
+    # ---- Section 6: Per-category annotation count comparison ----
+    st.markdown("---")
+    st.markdown("### 6. Per-Category Annotation Counts (raw COCO)")
+    st.markdown("Direct count from the COCO JSON — verify nothing was lost during loading.")
+
+    raw_cat_counts = Counter()
+    for a in coco_raw["annotations"]:
+        raw_cat_counts[a["category_id"]] += 1
+
+    raw_rows = []
+    for cid in sorted(raw_cat_counts.keys()):
+        cname = coco_cat_map.get(cid, "???")
+        sc = _ROBOFLOW_NAME_TO_SHORT_CODE.get(cname)
+        if sc is None:
+            sc = cname if cname in LABEL_META_BY_SHORT_CODE else "—"
+        # Compare with what load_coco_annotations produced
+        loaded_count = len(df_rf[df_rf["Label"] == sc]) if sc != "—" and len(df_rf) else 0
+        raw_count = raw_cat_counts[cid]
+        match = raw_count == loaded_count
+        raw_rows.append({
+            "COCO ID": cid,
+            "Category": cname,
+            "Short Code": sc,
+            "Raw COCO count": raw_count,
+            "Loaded count": loaded_count,
+            "Match": "yes" if match else f"MISMATCH (diff={raw_count - loaded_count})",
+        })
+
+    raw_df = pd.DataFrame(raw_rows)
+    mismatches = raw_df[~raw_df["Match"].str.startswith("yes")]
+    if len(mismatches):
+        st.warning(f"{len(mismatches)} category/ies have count mismatches between raw COCO and loaded data. "
+                   "This is expected when unmatched images are excluded or categories are unmapped.")
+    st.dataframe(raw_df, width="stretch", hide_index=True)
+
+    # ---- Section 7: Duplicate normalized names ----
+    st.markdown("---")
+    st.markdown("### 7. Duplicate Normalized Names")
+    norm_counts = Counter(info["norm"] for info in coco_img_meta.values())
+    dupes = {k: v for k, v in norm_counts.items() if v > 1}
+    if dupes:
+        st.error(f"{len(dupes)} normalized image name(s) appear more than once — "
+                 "this would cause data collision!")
+        dupe_rows = []
+        for name, cnt in sorted(dupes.items(), key=lambda x: -x[1]):
+            variants = [info for info in coco_img_meta.values() if info["norm"] == name]
+            for v in variants:
+                dupe_rows.append({
+                    "Normalized": name,
+                    "file_name": v["file_name"],
+                    "extra.name": v["extra_name"],
+                    "Count": cnt,
+                })
+        st.dataframe(pd.DataFrame(dupe_rows), width="stretch", hide_index=True)
+    else:
+        st.success("No duplicate normalized names — each COCO image maps to a unique identifier.")
